@@ -7,7 +7,7 @@ import { StatusCodes } from "http-status-codes";
 // ==============================
 // Models
 // ==============================
-import User from "../models/user.model.js";
+import User, { TokenBlacklist } from "../models/user.model.js";
 
 // ==============================
 // Middleware
@@ -37,6 +37,12 @@ const authMiddleware = asyncHandler(async (req, _, next) => {
   if (!token) {
     logger.warn("AuthMiddleware: No token provided");
     throw new ApiError(StatusCodes.UNAUTHORIZED, "Authentication required");
+  }
+
+  const isBlacklisted = await TokenBlacklist.findOne({ token });
+
+  if (isBlacklisted) {
+    throw new ApiError(StatusCodes.UNAUTHORIZED, "Token revoked");
   }
 
   try {

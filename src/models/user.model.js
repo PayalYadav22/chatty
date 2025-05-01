@@ -31,6 +31,20 @@ import {
 } from "../constants/constant.js";
 
 // ==============================
+// Token BlackList Schema Definition
+// ==============================
+
+const TokenBlacklistSchema = new mongoose.Schema({
+  token: { type: String, required: true, unique: true },
+  expiresAt: { type: Date, required: true },
+});
+
+export const TokenBlacklist = mongoose.model(
+  "TokenBlacklist",
+  TokenBlacklistSchema
+);
+
+// ==============================
 // Token Schema Definition
 // ==============================
 const TokenSchema = new mongoose.Schema(
@@ -52,7 +66,7 @@ const TokenSchema = new mongoose.Schema(
 
 TokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-const Token = mongoose.model("Token", TokenSchema);
+export const Token = mongoose.model("Token", TokenSchema);
 
 // ==============================
 // User Schema Definition
@@ -180,6 +194,13 @@ const UserSchema = new mongoose.Schema(
 );
 
 // ==============================
+// Index
+// ==============================
+UserSchema.index({ email: 1 });
+UserSchema.index({ userName: 1 });
+UserSchema.index({ phone: 1 });
+
+// ==============================
 // Virtuals
 // ==============================
 UserSchema.virtual("isLocked").get(function () {
@@ -187,21 +208,46 @@ UserSchema.virtual("isLocked").get(function () {
 });
 
 // ==============================
+// Plugins
+// ==============================
+UserSchema.plugin(mongooseDelete, {
+  deletedAt: true,
+  overrideMethods: "all",
+});
+
+UserSchema.plugin(mongooseHidden, {
+  hidden: {
+    password: true,
+    otp: true,
+    twoFactorSecret: true,
+    qrCode: true,
+    loginAttempts: true,
+    lockUntil: true,
+    passwordResetToken: true,
+    passwordResetTokenExpiration: true,
+  },
+});
+
+UserSchema.plugin(uniqueValidator, {
+  message: "{PATH} already exists.",
+});
+
+// ==============================
 // Pre-save Hook
 // ==============================
 UserSchema.pre("save", async function (next) {
-  // Only proceed if password is modified
-  if (this.isModified("password")) {
-    try {
-      // Check if password exists
+  try {
+    // Only proceed if password is modified
+    if (this.isModified("password")) {
+      // Validate password
       if (!this.password) {
         return next(
           new ApiError(StatusCodes.BAD_REQUEST, "Password is required")
         );
       }
 
-      // Check if password history is being reused
-      if (this.passwordHistory && this.passwordHistory.length > 0) {
+      // Check if password is reused from history
+      if (this.passwordHistory?.length > 0) {
         const isReused = await Promise.all(
           this.passwordHistory.map((oldHash) =>
             bcrypt.compare(this.password, oldHash)
@@ -214,32 +260,37 @@ UserSchema.pre("save", async function (next) {
         }
       }
 
-      // Hash the password
+      // Hash new password
       const saltRound = await bcrypt.genSalt(salt);
       this.password = await bcrypt.hash(this.password, saltRound);
       this.passwordChangedAt = new Date();
 
-      // Update password history
-      this.passwordHistory = [...(this.passwordHistory || []), this.password];
-      if (this.passwordHistory.length > 5) {
-        this.passwordHistory = this.passwordHistory.slice(-5);
-      }
-    } catch (error) {
-      return next(error);
+      // Update password history (limit to 5 most recent)
+      this.passwordHistory = [
+        this.password,
+        ...(this.passwordHistory || []),
+      ].slice(0, 5);
     }
-  }
 
-  // Only proceed if OTP is modified and exists
-  if (this.isModified("otp") && this.otp) {
-    try {
+    // Only proceed if OTP is modified and exists
+    if (this.isModified("otp") && this.otp) {
       const saltRound = await bcrypt.genSalt(salt);
       this.otp = await bcrypt.hash(this.otp, saltRound);
-    } catch (error) {
-      return next(error);
     }
-  }
 
-  next();
+    // Validate user schema
+    const userJsonSchema = this.toJSONSchema();
+    const validate = ajv.compile(userJsonSchema);
+    if (!validate(this.toObject())) {
+      return next(
+        new ApiError(StatusCodes.BAD_REQUEST, validate.errors[0].message)
+      );
+    }
+
+    next();
+  } catch (error) {
+    next(error);
+  }
 });
 
 // ==============================
@@ -395,33 +446,6 @@ UserSchema.statics.generateTwoFactorAuth = async function (user) {
 
   return { qrCodeUrl, secret };
 };
-
-// ==============================
-// Plugins
-// ==============================
-UserSchema.plugin(mongooseDelete, {
-  deletedAt: true,
-  overrideMethods: "all",
-});
-
-UserSchema.plugin(mongooseHidden(), {
-  hidden: {
-    password: true,
-    passwordResetToken: true,
-    passwordResetTokenExpiration: true,
-    loginAttempts: true,
-    lockUntil: true,
-    otp: true,
-    otpExpiry: true,
-    twoFactorSecret: true,
-    qrCode: true,
-    passwordHistory: true,
-  },
-});
-
-UserSchema.plugin(uniqueValidator, {
-  message: "{PATH} already exists.",
-});
 
 // ==============================
 // Model Export

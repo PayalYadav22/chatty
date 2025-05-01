@@ -11,6 +11,7 @@ import bcrypt from "bcryptjs";
 import User from "../../models/user.model.js";
 import Session from "../../models/session.model.js";
 import LoginAttempt from "../../models/loginAttempt.model.js";
+import { TokenBlacklist } from "../../models/user.model.js";
 
 // ==============================
 // Middleware
@@ -68,6 +69,7 @@ const AuthController = {
     const existingUser = await User.findOne({
       $or: [{ email }, { userName }, { phone }],
     });
+
     if (existingUser) {
       throw new ApiError(
         StatusCodes.CONFLICT,
@@ -90,11 +92,16 @@ const AuthController = {
       },
       otp,
       otpExpiry,
+      isVerified: false,
+      twoFactorEnabled: false,
     });
 
     const { qrCodeUrl, secret } = await User.generateTwoFactorAuth(user);
+
     user.qrCode = qrCodeUrl;
+
     user.twoFactorSecret = secret;
+
     await user.save({ validateBeforeSave: false });
 
     try {
@@ -105,12 +112,6 @@ const AuthController = {
         context: { name: user.fullName, otp, expiresIn: expireTime },
       });
 
-      const { accessToken, refreshToken } = await User.generateToken(user._id);
-
-      res
-        .cookie("accessToken", accessToken, options)
-        .cookie("refreshToken", refreshToken, options);
-
       return new ApiResponse(
         StatusCodes.CREATED,
         {
@@ -120,10 +121,9 @@ const AuthController = {
           email: user.email,
           avatar: user.avatar,
           role: user.role,
-          token: { accessToken, refreshToken },
           qrCode: user.qrCode,
         },
-        "User registered with 2FA."
+        "User registered with 2FA and Please verify your email."
       ).send(res);
     } catch (error) {
       await User.findByIdAndDelete(user._id);
@@ -138,6 +138,7 @@ const AuthController = {
 
   verifyUser: asyncHandler(async (req, res) => {
     const { email, otp } = req.body;
+
     if (!email || !otp) {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Email and OTP required.");
     }
@@ -155,13 +156,25 @@ const AuthController = {
 
     user.isVerified = true;
     user.otp = undefined;
-    user.otpExpiry = undefined;
     await user.save({ validateBeforeSave: false });
 
+    // Generate JWT tokens after email verification
+    const { accessToken, refreshToken } = await User.generateToken(user._id);
+    res
+      .cookie("accessToken", accessToken, options)
+      .cookie("refreshToken", refreshToken, options);
     return new ApiResponse(
       StatusCodes.OK,
-      { isVerified: true },
-      "Email verified successfully."
+      {
+        id: user._id,
+        fullName: user.fullName,
+        userName: user.userName,
+        email: user.email,
+        avatar: user.avatar,
+        role: user.role,
+        token: { accessToken, refreshToken },
+      },
+      "Email verified successfully. You can now log in."
     ).send(res);
   }),
 
@@ -312,13 +325,14 @@ const AuthController = {
       );
     }
 
-    const validOld = await user.comparePassword(oldPassword);
-    if (!validOld) {
+    const isValid = await user.comparePassword(oldPassword);
+
+    if (!isValid) {
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Incorrect old password.");
     }
 
+    user.passwordHistory.push(user.password);
     user.password = newPassword;
-    user.passwordHistory = [...user.passwordHistory, user.password];
     if (user.passwordHistory.length > 5) {
       user.passwordHistory = user.passwordHistory.slice(-5);
     }
@@ -334,20 +348,21 @@ const AuthController = {
 
   logoutUser: asyncHandler(async (req, res) => {
     const refreshToken = req?.cookies?.refreshToken;
+
     if (!refreshToken) {
       throw new ApiError(StatusCodes.BAD_REQUEST, "Refresh token required.");
     }
 
     try {
       const decoded = jwt.verify(refreshToken, refreshTokenSecret);
+
       await Session.deleteMany({ userId: decoded._id });
     } catch (error) {
-      logger.error(`Logout error: ${error.message}`);
+      logger.error(error);
+      throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid token.");
     }
 
-    res
-      .clearCookie("accessToken", options)
-      .clearCookie("refreshToken", options);
+    res.clearCookie("accessToken").clearCookie("refreshToken");
     return new ApiResponse(StatusCodes.OK, "Logged out successfully.").send(
       res
     );
@@ -388,6 +403,24 @@ const AuthController = {
       StatusCodes.OK,
       { token: { accessToken, refreshToken } },
       "Token refreshed successfully."
+    ).send(res);
+  }),
+
+  blacklistToken: asyncHandler(async (req, res) => {
+    const { token } = req.body;
+
+    if (!token) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, "Token is required.");
+    }
+
+    await TokenBlacklist.create({
+      token,
+      expiresAt: new Date(Date.now() + expireTime),
+    });
+
+    return new ApiResponse(
+      StatusCodes.OK,
+      "Token blacklisted successfully."
     ).send(res);
   }),
 };

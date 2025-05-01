@@ -12,6 +12,10 @@ import AuthController from "../../controllers/auth/auth.controller.js";
 // Middleware
 // ==============================
 import upload from "../../middleware/multer.middleware.js";
+import {
+  registerLimiter,
+  authLimiter,
+} from "../../middleware/rateLimiter.middleware.js";
 
 const router = express.Router();
 
@@ -22,7 +26,7 @@ const router = express.Router();
  */
 router
   .route("/register")
-  .post(upload.single("avatar"), AuthController.registerUser);
+  .post(upload.single("avatar"), registerLimiter, AuthController.registerUser);
 
 /**
  * @route   POST /api/v1/auth/verify-email
@@ -36,14 +40,16 @@ router.route("/verify-email").post(AuthController.verifyUser);
  * @desc    Log in an existing user
  * @access  Public
  */
-router.route("/login").post(AuthController.loginUser);
+router.route("/login").post(authLimiter, AuthController.loginUser);
 
 /**
  * @route   POST /api/v1/auth/forgot-password
  * @desc    Initiate password reset by sending email to user
  * @access  Public
  */
-router.route("/forgot-password").post(AuthController.forgotUserPassword);
+router
+  .route("/forgot-password")
+  .post(authLimiter, AuthController.forgotUserPassword);
 
 /**
  * @route   POST /api/v1/auth/reset-password/:token
@@ -58,5 +64,12 @@ router.route("/reset-password/:token").post(AuthController.resetUserPassword);
  * @access  Public
  */
 router.route("/refresh-token").post(AuthController.refreshUserToken);
+
+/**
+ * @route   POST /api/v1/auth/block-token
+ * @desc    Blacklist a JWT refresh/access token to prevent further use
+ * @access  Public
+ */
+router.route("/block-token").post(AuthController.blacklistToken);
 
 export default router;
