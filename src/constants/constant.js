@@ -25,3 +25,6 @@ export const options = {
   sameSite: "strict",
   maxAge: 24 * 60 * 60 * 1000,
 };
+
+export const maxLoginAttempt = 5;
+export const lockTime = 15 * 60 * 1000;

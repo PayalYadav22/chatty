@@ -4,7 +4,10 @@
 import mongoose from "mongoose";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import { StatusCodes } from "http-status-codes";
+import speakeasy from "speakeasy";
+import QRCode from "qrcode";
 
 // ==============================
 // Utils
@@ -20,12 +23,38 @@ import {
   refreshTokenSecret,
   accessTokenExpiresIn,
   refreshTokenExpiresIn,
+  maxLoginAttempt,
+  lockTime,
 } from "../constants/constant.js";
 
 // ==============================
-// Schema Definition
+// Token Schema Definition
 // ==============================
-const UserSchema = mongoose.Schema(
+const TokenSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    token: { type: String, required: true },
+    type: { type: String, enum: ["access", "refresh"], required: true },
+    expiresAt: {
+      type: Date,
+      required: true,
+    },
+  },
+  { timestamps: true }
+);
+
+TokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+
+const Token = mongoose.model("Token", TokenSchema);
+
+// ==============================
+// User Schema Definition
+// ==============================
+const UserSchema = new mongoose.Schema(
   {
     fullName: {
       type: String,
@@ -51,7 +80,6 @@ const UserSchema = mongoose.Schema(
       unique: true,
       minlength: [3, "Username must be at least 3 characters long"],
       maxlength: [30, "Username cannot exceed 30 characters."],
-      select: false,
     },
     phone: {
       type: String,
@@ -63,73 +91,125 @@ const UserSchema = mongoose.Schema(
       type: String,
       trim: true,
       required: [true, "Password is required."],
-      minlength: [6, "Password must be at least 6 characters long"],
+      minlength: [8, "Password must be at least 8 characters long"],
       maxlength: [20, "Password cannot exceed 20 characters"],
+      match: [
+        /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/,
+        "Password must be strong: at least 8 characters with uppercase, lowercase, number, and symbol.",
+      ],
+      select: false,
     },
+    passwordChangedAt: { type: Date },
     passwordResetToken: {
       type: String,
       validate: {
-        validator: (value) => {
-          return value ? value.length === 32 : true;
-        },
+        validator: (value) => !value || value.length === 64,
         message: "Invalid password reset token format.",
       },
     },
     passwordResetTokenExpiration: {
       type: Date,
       validate: {
-        validator: (value) => {
-          return value ? value > new Date() : true;
-        },
+        validator: (value) => !value || value > new Date(),
         message: "Password reset token has expired.",
+      },
+    },
+    passwordHistory: {
+      type: [String],
+      select: false,
+      default: [],
+      validate: {
+        validator: function (arr) {
+          return arr.length <= 5;
+        },
+        message: "Password history exceeds limit.",
       },
     },
     avatar: {
       url: {
         type: String,
         validate: {
-          validator: (value) => {
-            return value
-              ? /^https?:\/\/.*\.(jpg|jpeg|png|gif)$/i.test(value)
-              : true;
-          },
+          validator: (value) =>
+            !value || /^https?:\/\/.*\.(jpg|jpeg|png|gif)$/i.test(value),
           message: "Invalid avatar image URL format.",
         },
       },
-      publicId: {
-        type: String,
-      },
+      publicId: { type: String },
     },
     role: {
       type: String,
       enum: ["user", "admin", "superAdmin"],
       default: "user",
-      required: [true, "Role is required."],
     },
-    token: {
-      accessToken: {
-        type: String,
-        select: false,
-      },
-      refreshToken: {
-        type: String,
-        select: false,
-      },
+    loginAttempts: {
+      type: Number,
+      default: 0,
     },
+    lockUntil: { type: Date },
+    twoFactorEnabled: { type: Boolean, default: false },
+    twoFactorSecret: { type: String, select: false },
+    qrCode: { type: String, select: false },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+    toJSON: {
+      virtuals: true,
+      transform(doc, ret) {
+        ret.id = ret._id.toString();
+        delete ret._id;
+        delete ret.__v;
+        delete ret.password;
+        delete ret.loginAttempts;
+        delete ret.lockUntil;
+        delete ret.passwordResetToken;
+        delete ret.passwordResetTokenExpiration;
+        return ret;
+      },
+    },
+  }
 );
 
 // ==============================
-// Schema Hooks
+// Virtuals
+// ==============================
+UserSchema.virtual("isLocked").get(function () {
+  return !!(this.lockUntil && this.lockUntil > Date.now());
+});
+
+// ==============================
+// Pre-save Hook
 // ==============================
 UserSchema.pre("save", async function (next) {
+  if (this.passwordHistory && this.passwordHistory.length > 0) {
+    const isReused = await Promise.all(
+      this.passwordHistory.map((oldHash) =>
+        bcrypt.compare(this.password, oldHash)
+      )
+    );
+    if (isReused.includes(true)) {
+      return next(
+        new ApiError(StatusCodes.BAD_REQUEST, "Password was used recently.")
+      );
+    }
+  }
+  this.passwordHistory = [...(this.passwordHistory || []), this.password];
+  if (this.passwordHistory.length > 5) {
+    this.passwordHistory = this.passwordHistory.slice(-5);
+  }
   if (!this.isModified("password")) return next();
 
   try {
-    const saltRounds = Number(salt);
-    const salt = await bcrypt.genSalt(saltRounds);
-    this.password = await bcrypt.hash(this.password, salt);
+    const getSaltRound = await bcrypt.genSalt(salt);
+    this.password = await bcrypt.hash(this.password, getSaltRound);
+    this.passwordChangedAt = new Date();
+    next();
+  } catch (error) {
+    next(error);
+  }
+  if (!this.isModified("qrCode")) return next();
+  try {
+    const getSaltRound = await bcrypt.genSalt(salt);
+    this.qrCode = await bcrypt.hash(this.qrCode, getSaltRound);
     next();
   } catch (error) {
     next(error);
@@ -137,9 +217,9 @@ UserSchema.pre("save", async function (next) {
 });
 
 // ==============================
-// Schema Methods
+// Instance Methods
 // ==============================
-UserSchema.methods.comparePassword = async function (password) {
+UserSchema.methods.comparePassword = async function (candidatePassword) {
   if (!this.password) {
     throw new ApiError(
       StatusCodes.INTERNAL_SERVER_ERROR,
@@ -147,8 +227,7 @@ UserSchema.methods.comparePassword = async function (password) {
     );
   }
 
-  const isMatch = await bcrypt.compare(password, this.password);
-
+  const isMatch = await bcrypt.compare(candidatePassword, this.password);
   if (!isMatch) {
     throw new ApiError(StatusCodes.UNAUTHORIZED, "Incorrect password.");
   }
@@ -156,7 +235,7 @@ UserSchema.methods.comparePassword = async function (password) {
   return true;
 };
 
-UserSchema.methods.generateAccessToken = async function () {
+UserSchema.methods.generateAccessToken = function () {
   return jwt.sign(
     {
       id: this._id,
@@ -171,45 +250,113 @@ UserSchema.methods.generateAccessToken = async function () {
   );
 };
 
-UserSchema.methods.generateRefreshToken = async function () {
-  return jwt.sign(
-    {
-      id: this._id,
-    },
-    refreshTokenSecret,
-    { expiresIn: refreshTokenExpiresIn }
-  );
+UserSchema.methods.generateRefreshToken = function () {
+  return jwt.sign({ id: this._id }, refreshTokenSecret, {
+    expiresIn: refreshTokenExpiresIn,
+  });
 };
 
-UserSchema.methods.generateCryptoToken = async function () {
+UserSchema.methods.generateCryptoToken = function () {
   return crypto.randomBytes(32).toString("hex");
 };
 
+UserSchema.methods.incLoginAttempts = async function () {
+  if (this.lockUntil && this.lockUntil < Date.now()) {
+    this.loginAttempts = 1;
+    this.lockUntil = undefined;
+  } else {
+    this.loginAttempts += 1;
+    if (this.loginAttempts >= maxLoginAttempt && !this.isLocked) {
+      this.lockUntil = Date.now() + lockTime;
+    }
+  }
+  await this.save({ validateBeforeSave: false });
+};
+
+UserSchema.methods.resetLoginAttempts = async function () {
+  this.loginAttempts = 0;
+  this.lockUntil = undefined;
+  await this.save({ validateBeforeSave: false });
+};
+
+UserSchema.methods.revokeTokens = async function () {
+  await Token.deleteMany({ userId: this._id });
+};
+
+UserSchema.methods.changedPasswordAfter = function (JWTTimestamp) {
+  if (this.passwordChangedAt) {
+    const changedTimestamp = parseInt(
+      this.passwordChangedAt.getTime() / 1000,
+      10
+    );
+    return JWTTimestamp < changedTimestamp;
+  }
+  return false;
+};
+
+UserSchema.method.verifyTwoFactorCode = function (user, token) {
+  const isVerified = speakeasy.totp.verify({
+    secret: user.twoFactorSecret,
+    encoding: "base32",
+    token,
+  });
+
+  if (!isVerified) {
+    throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid 2FA code.");
+  }
+
+  return true;
+};
+
 // ==============================
-// Schema Statics
+// Static Methods
 // ==============================
 UserSchema.statics.generateToken = async function (id) {
   if (!mongoose.Types.ObjectId.isValid(id)) {
-    throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid ID format.");
+    throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid user ID.");
   }
 
-  const user = await User.findById(id);
-
+  const user = await this.findById(id);
   if (!user) {
     throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
   }
 
-  const accessToken = await user.generateAccessToken();
-  const refreshToken = await user.generateRefreshToken();
+  const accessToken = user.generateAccessToken();
+  const refreshToken = user.generateRefreshToken();
 
-  user.token = {
-    accessToken,
-    refreshToken,
-  };
+  const now = Date.now();
 
-  await user.save({ validateBeforeSave: false });
+  await Token.create([
+    {
+      userId: user._id,
+      token: accessToken,
+      type: "access",
+      expiresAt: new Date(now + accessTokenExpiresIn * 1000),
+    },
+    {
+      userId: user._id,
+      token: refreshToken,
+      type: "refresh",
+      expiresAt: new Date(now + refreshTokenExpiresIn * 1000),
+    },
+  ]);
 
   return { accessToken, refreshToken };
+};
+
+UserSchema.statics.generateTwoFactorAuth = async function (user) {
+  const secret = speakeasy.generateSecret({
+    length: 20,
+    name: `chatty (${user.email})`,
+  });
+
+  user.twoFactorSecret = secret.base32;
+  user.twoFactorEnabled = true;
+  await user.save();
+
+  const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
+
+  return { qrCodeUrl, secret };
 };
 
 // ==============================

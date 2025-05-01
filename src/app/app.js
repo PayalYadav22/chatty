@@ -1,10 +1,14 @@
 import { Server } from "socket.io";
 import http from "http";
 import express from "express";
+import helmet from "helmet";
 import router from "../routes/routes.js";
 import cookieParser from "cookie-parser";
 
 const app = express();
+
+app.use(helmet());
+
 const server = http.createServer(app);
 
 const io = new Server(server, {

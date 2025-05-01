@@ -2,11 +2,14 @@
 // External Packages
 // ==============================
 import { StatusCodes } from "http-status-codes";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
 // ==============================
 // Models
 // ==============================
 import User from "../../models/user.model.js";
+import Session from "../../models/session.model.js";
 
 // ==============================
 // Middleware
@@ -77,7 +80,7 @@ const AuthController = {
     if (existingUser) {
       throw new ApiError(
         StatusCodes.CONFLICT,
-        "A user with the provided email or username already exists."
+        "A user with the provided email, username, or phone already exists."
       );
     }
 
@@ -100,8 +103,15 @@ const AuthController = {
       );
     }
 
+    const { qrCodeUrl, secret } = await User.generateTwoFactorAuth(user);
+
+    user.qrCode = qrCodeUrl;
+    user.twoFactorSecret = secret;
+
+    await user.save({ validateBeforeSave: false });
+
     try {
-      const { accessToken, refreshToken } = await User.generateToken(user?._id);
+      const { accessToken, refreshToken } = await User.generateToken(user._id);
 
       res
         .cookie("accessToken", accessToken, options)
@@ -116,16 +126,14 @@ const AuthController = {
           email: user.email,
           avatar: user.avatar,
           role: user.role,
-          token: {
-            accessToken,
-            refreshToken,
-          },
+          token: { accessToken, refreshToken },
+          qrCode: user.qrCode,
         },
-        "User registered successfully."
+        "User registered with 2FA enabled. Scan the QR code with your authenticator app."
       ).send(res);
     } catch (error) {
-      await User.findByIdAndDelete(user?._id);
-      await deleteFileToCloudinary(user?.avatar?.publicId);
+      await User.findByIdAndDelete(user._id);
+      await deleteFileToCloudinary(user.avatar.publicId);
       logger.error(error);
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
@@ -135,34 +143,63 @@ const AuthController = {
   }),
 
   loginUser: asyncHandler(async (req, res) => {
-    const { userName, phone, email, password } = req.body;
+    const { email, phone, password, twoFactorCode } = req.body;
 
-    if (!password || !(userName && phone && email)) {
+    if (!password || !(phone || email)) {
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Password and one identifier required"
+        "Password and at least one identifier (email, username, or phone) are required."
       );
     }
 
     const user = await User.findOne({
       $or: [{ email }, { userName }, { phone }],
-    })
-      .select("+password +token")
-      .lean();
+    }).select("+password +twoFactorSecret +twoFactorEnabled");
 
     if (!user)
-      throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid credentials");
+      throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid credentials.");
+
+    if (user.isLocked) {
+      const minutesLeft = Math.ceil((user.lockUntil - Date.now()) / 60000);
+      throw new ApiError(
+        StatusCodes.FORBIDDEN,
+        `Account is locked. Try again in ${minutesLeft} minutes.`
+      );
+    }
 
     const isValid = await user.comparePassword(password);
 
     if (!isValid) {
+      await user.incLoginAttempts();
       throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid credentials.");
+    }
+
+    await user.resetLoginAttempts();
+
+    if (user.twoFactorEnabled) {
+      if (!twoFactorCode) {
+        throw new ApiError(StatusCodes.BAD_REQUEST, "2FA code is required.");
+      }
+
+      await user.verifyTwoFactorCode(user, twoFactorCode);
     }
 
     try {
       const { accessToken, refreshToken } = await User.generateToken(user._id);
 
-      // Set cookies for tokens
+      const ip = req.ip || req.connection.remoteAddress;
+      const userAgent = req.headers["user-agent"];
+
+      const expiresAt = new Date(Date.now() + expireTime);
+
+      await Session.create({
+        userId: user._id,
+        ip,
+        userAgent,
+        token: accessToken,
+        expiresAt,
+      });
+
       res
         .cookie("accessToken", accessToken, options)
         .cookie("refreshToken", refreshToken, options);
@@ -176,12 +213,9 @@ const AuthController = {
           email: user.email,
           avatar: user.avatar,
           role: user.role,
-          token: {
-            accessToken,
-            refreshToken,
-          },
+          token: { accessToken, refreshToken },
         },
-        "Login successful."
+        "User logged in successfully."
       ).send(res);
     } catch (error) {
       logger.error(error);
@@ -204,7 +238,7 @@ const AuthController = {
     }
 
     // Find user by email
-    const user = await User.findOne({ email }).lean();
+    const user = await User.findOne({ email });
 
     if (!user) {
       throw new ApiError(
@@ -268,12 +302,25 @@ const AuthController = {
     const user = await User.findOne({
       passwordResetToken: token,
       passwordResetTokenExpiration: { $gt: Date.now() },
-    }).lean();
+    });
 
     if (!user) {
       throw new ApiError(
         StatusCodes.UNAUTHORIZED,
         "Invalid or expired password reset token."
+      );
+    }
+
+    // Check if the new password has been used before
+    const isReused = await Promise.all(
+      user.passwordHistory.map((oldHash) =>
+        bcrypt.compare(newPassword, oldHash)
+      )
+    );
+    if (isReused.includes(true)) {
+      throw new ApiError(
+        StatusCodes.BAD_REQUEST,
+        "New password cannot be the same as a previous password."
       );
     }
 
@@ -289,6 +336,12 @@ const AuthController = {
     user.password = newPassword;
     user.passwordResetToken = undefined;
     user.passwordResetTokenExpiration = undefined;
+
+    // Update password history
+    user.passwordHistory = [...user.passwordHistory, user.password];
+    if (user.passwordHistory.length > 5) {
+      user.passwordHistory = user.passwordHistory.slice(-5);
+    }
 
     await user.save({ validateBeforeSave: false });
 
@@ -307,6 +360,7 @@ const AuthController = {
 
     try {
       const decoded = jwt.verify(refreshToken, refreshTokenSecret);
+      await Session.deleteMany({ userId: decoded._id });
     } catch (error) {
       logger.error(`Logout error: ${error.message}`);
     }

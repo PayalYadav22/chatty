@@ -6,9 +6,7 @@
 - User login
 - JWT token generation
 - OTP email verification
-
-## PENDING
-
+- 2 Way Verification email verification
 - Brute-force protection
 - Password recovery
 
