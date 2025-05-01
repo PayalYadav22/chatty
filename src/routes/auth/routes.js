@@ -25,6 +25,13 @@ router
   .post(upload.single("avatar"), AuthController.registerUser);
 
 /**
+ * @route   POST /api/v1/auth/verify-email
+ * @desc    Verify a new user email with OTP
+ * @access  Public
+ */
+router.route("/verify-email").post(AuthController.verifyUser);
+
+/**
  * @route   POST /api/v1/auth/login
  * @desc    Log in an existing user
  * @access  Public

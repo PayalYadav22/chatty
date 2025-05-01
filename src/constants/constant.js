@@ -9,8 +9,8 @@ export const cloudinaryApiSecret = process.env.CLOUDINARY_API_SECRET;
 
 export const accessTokenSecret = process.env.JWT_ACCESS_TOKEN_SECRET;
 export const accessTokenExpiresIn = process.env.JWT_ACCESS_TOKEN_EXPIRESIN;
-export const refreshTokenSecret = process.env.JWT_REFRESH_TOKEN_SECRET;
 export const refreshTokenExpiresIn = process.env.JWT_REFRESH_TOKEN_EXPIRESIN;
+export const refreshTokenSecret = process.env.JWT_REFRESH_TOKEN_SECRET;
 
 export const emailId = process.env.USER_EMAIL_ID;
 export const emailPassword = process.env.USER_EMAIL_PASSWORD;

@@ -5,7 +5,7 @@
 - User registration
 - User login
 - JWT token generation
-- OTP email verification
+- OTP + email verification
 - 2 Way Verification email verification
 - Brute-force protection
 - Password recovery

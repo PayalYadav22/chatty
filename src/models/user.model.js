@@ -8,6 +8,9 @@ import crypto from "crypto";
 import { StatusCodes } from "http-status-codes";
 import speakeasy from "speakeasy";
 import QRCode from "qrcode";
+import mongooseDelete from "mongoose-delete";
+import mongooseHidden from "mongoose-hidden";
+import uniqueValidator from "mongoose-unique-validator";
 
 // ==============================
 // Utils
@@ -92,7 +95,7 @@ const UserSchema = new mongoose.Schema(
       trim: true,
       required: [true, "Password is required."],
       minlength: [8, "Password must be at least 8 characters long"],
-      maxlength: [20, "Password cannot exceed 20 characters"],
+      maxlength: [100, "Password cannot exceed 100 characters"],
       match: [
         /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/,
         "Password must be strong: at least 8 characters with uppercase, lowercase, number, and symbol.",
@@ -125,6 +128,8 @@ const UserSchema = new mongoose.Schema(
         message: "Password history exceeds limit.",
       },
     },
+    otp: { type: String, select: false },
+    otpExpiry: { type: Date, select: false },
     avatar: {
       url: {
         type: String,
@@ -141,6 +146,10 @@ const UserSchema = new mongoose.Schema(
       enum: ["user", "admin", "superAdmin"],
       default: "user",
     },
+    isVerified: {
+      type: Boolean,
+      default: false,
+    },
     loginAttempts: {
       type: Number,
       default: 0,
@@ -149,6 +158,7 @@ const UserSchema = new mongoose.Schema(
     twoFactorEnabled: { type: Boolean, default: false },
     twoFactorSecret: { type: String, select: false },
     qrCode: { type: String, select: false },
+    tokenVersion: { type: Number, default: 0 },
   },
   {
     timestamps: true,
@@ -180,58 +190,86 @@ UserSchema.virtual("isLocked").get(function () {
 // Pre-save Hook
 // ==============================
 UserSchema.pre("save", async function (next) {
-  if (this.passwordHistory && this.passwordHistory.length > 0) {
-    const isReused = await Promise.all(
-      this.passwordHistory.map((oldHash) =>
-        bcrypt.compare(this.password, oldHash)
-      )
-    );
-    if (isReused.includes(true)) {
-      return next(
-        new ApiError(StatusCodes.BAD_REQUEST, "Password was used recently.")
-      );
+  // Only proceed if password is modified
+  if (this.isModified("password")) {
+    try {
+      // Check if password exists
+      if (!this.password) {
+        return next(
+          new ApiError(StatusCodes.BAD_REQUEST, "Password is required")
+        );
+      }
+
+      // Check if password history is being reused
+      if (this.passwordHistory && this.passwordHistory.length > 0) {
+        const isReused = await Promise.all(
+          this.passwordHistory.map((oldHash) =>
+            bcrypt.compare(this.password, oldHash)
+          )
+        );
+        if (isReused.includes(true)) {
+          return next(
+            new ApiError(StatusCodes.BAD_REQUEST, "Password was used recently.")
+          );
+        }
+      }
+
+      // Hash the password
+      const saltRound = await bcrypt.genSalt(salt);
+      this.password = await bcrypt.hash(this.password, saltRound);
+      this.passwordChangedAt = new Date();
+
+      // Update password history
+      this.passwordHistory = [...(this.passwordHistory || []), this.password];
+      if (this.passwordHistory.length > 5) {
+        this.passwordHistory = this.passwordHistory.slice(-5);
+      }
+    } catch (error) {
+      return next(error);
     }
   }
-  this.passwordHistory = [...(this.passwordHistory || []), this.password];
-  if (this.passwordHistory.length > 5) {
-    this.passwordHistory = this.passwordHistory.slice(-5);
-  }
-  if (!this.isModified("password")) return next();
 
-  try {
-    const getSaltRound = await bcrypt.genSalt(salt);
-    this.password = await bcrypt.hash(this.password, getSaltRound);
-    this.passwordChangedAt = new Date();
-    next();
-  } catch (error) {
-    next(error);
+  // Only proceed if OTP is modified and exists
+  if (this.isModified("otp") && this.otp) {
+    try {
+      const saltRound = await bcrypt.genSalt(salt);
+      this.otp = await bcrypt.hash(this.otp, saltRound);
+    } catch (error) {
+      return next(error);
+    }
   }
-  if (!this.isModified("qrCode")) return next();
-  try {
-    const getSaltRound = await bcrypt.genSalt(salt);
-    this.qrCode = await bcrypt.hash(this.qrCode, getSaltRound);
-    next();
-  } catch (error) {
-    next(error);
-  }
+
+  next();
 });
 
 // ==============================
 // Instance Methods
 // ==============================
-UserSchema.methods.comparePassword = async function (candidatePassword) {
+UserSchema.methods.comparePassword = async function (password) {
   if (!this.password) {
     throw new ApiError(
       StatusCodes.INTERNAL_SERVER_ERROR,
       "Password not set for this user."
     );
   }
-
-  const isMatch = await bcrypt.compare(candidatePassword, this.password);
+  const isMatch = await bcrypt.compare(password, this.password);
   if (!isMatch) {
     throw new ApiError(StatusCodes.UNAUTHORIZED, "Incorrect password.");
   }
+  return true;
+};
 
+UserSchema.methods.compareOTP = async function (otp) {
+  if (!this.otp) {
+    throw new ApiError(
+      StatusCodes.INTERNAL_SERVER_ERROR,
+      "OTP not set for this user."
+    );
+  }
+  const isMatch = await bcrypt.compare(otp, this.otp);
+  if (!isMatch) {
+    throw new ApiError(StatusCodes.UNAUTHORIZED, "Incorrect OTP.");
+  }
   return true;
 };
 
@@ -244,6 +282,7 @@ UserSchema.methods.generateAccessToken = function () {
       userName: this.userName,
       phone: this.phone,
       role: this.role,
+      tokenVersion: this.tokenVersion,
     },
     accessTokenSecret,
     { expiresIn: accessTokenExpiresIn }
@@ -294,17 +333,15 @@ UserSchema.methods.changedPasswordAfter = function (JWTTimestamp) {
   return false;
 };
 
-UserSchema.method.verifyTwoFactorCode = function (user, token) {
+UserSchema.methods.verifyTwoFactorCode = async function (user, token) {
   const isVerified = speakeasy.totp.verify({
     secret: user.twoFactorSecret,
     encoding: "base32",
     token,
   });
-
   if (!isVerified) {
     throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid 2FA code.");
   }
-
   return true;
 };
 
@@ -331,13 +368,13 @@ UserSchema.statics.generateToken = async function (id) {
       userId: user._id,
       token: accessToken,
       type: "access",
-      expiresAt: new Date(now + accessTokenExpiresIn * 1000),
+      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
     },
     {
       userId: user._id,
       token: refreshToken,
       type: "refresh",
-      expiresAt: new Date(now + refreshTokenExpiresIn * 1000),
+      expiresAt: new Date(Date.now() + 1 * 24 * 60 * 60 * 1000),
     },
   ]);
 
@@ -358,6 +395,33 @@ UserSchema.statics.generateTwoFactorAuth = async function (user) {
 
   return { qrCodeUrl, secret };
 };
+
+// ==============================
+// Plugins
+// ==============================
+UserSchema.plugin(mongooseDelete, {
+  deletedAt: true,
+  overrideMethods: "all",
+});
+
+UserSchema.plugin(mongooseHidden(), {
+  hidden: {
+    password: true,
+    passwordResetToken: true,
+    passwordResetTokenExpiration: true,
+    loginAttempts: true,
+    lockUntil: true,
+    otp: true,
+    otpExpiry: true,
+    twoFactorSecret: true,
+    qrCode: true,
+    passwordHistory: true,
+  },
+});
+
+UserSchema.plugin(uniqueValidator, {
+  message: "{PATH} already exists.",
+});
 
 // ==============================
 // Model Export
