@@ -1,22 +1,70 @@
+// ==============================
+// External Packages
+// ==============================
 import mongoose from "mongoose";
 
-const SessionSchema = new mongoose.Schema(
+// ==============================
+// Session Schema
+// ==============================
+const sessionSchema = new mongoose.Schema(
   {
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: "User",
       required: true,
+      index: true,
     },
-    ip: { type: String, required: true },
-    userAgent: { type: String, required: true },
-    token: { type: String, required: true },
-    expiresAt: { type: Date, required: true },
+    refreshTokenHash: {
+      type: String,
+      required: true,
+    },
+    ip: {
+      type: String,
+    },
+    userAgent: {
+      type: String,
+    },
+    deviceInfo: {
+      os: String,
+      browser: String,
+      device: String,
+    },
+    deviceFingerprint: {
+      type: String,
+      index: true,
+    },
+    isValid: {
+      type: Boolean,
+      default: true,
+      index: true,
+    },
+    expiresAt: {
+      type: Date,
+      required: true,
+    },
   },
-  { timestamps: true }
+  {
+    timestamps: true,
+  }
 );
 
-SessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+// ==============================
+// Indexes
+// ==============================
+sessionSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
-const Session = mongoose.model("Session", SessionSchema);
+// ==============================
+// Pre-save
+// ==============================
+sessionSchema.pre("save", function (next) {
+  if (!this.deviceFingerprint && this.userAgent && this.ip) {
+    this.deviceFingerprint = `${this.userAgent}:${this.ip}`;
+  }
+  next();
+});
 
+// ==============================
+// Export
+// ==============================
+const Session = mongoose.model("Session", sessionSchema);
 export default Session;

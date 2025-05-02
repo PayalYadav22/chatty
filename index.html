@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Generate reCAPTCHA Token</title>
+    <script src="https://www.google.com/recaptcha/api.js" async defer></script>
+  </head>
+  <body>
+    <h2>Generate reCAPTCHA Token</h2>
+
+    <!-- reCAPTCHA widget -->
+    <div
+      class="g-recaptcha"
+      data-sitekey="6Ldi8iYrAAAAAB10qtYDhae9HZziggYMUtTWI9vN"
+    ></div>
+
+    <button id="generate-token">Generate Token</button>
+
+    <script>
+      document
+        .getElementById("generate-token")
+        .addEventListener("click", async function () {
+          // Get the reCAPTCHA token after the user interacts with the widget
+          const recaptchaToken = grecaptcha.getResponse();
+
+          console.log(recaptchaToken);
+
+          if (!recaptchaToken) {
+            alert("Please complete the reCAPTCHA.");
+            return;
+          }
+
+          try {
+            // Send token to the server for verification
+            const response = await fetch(
+              "http://localhost:5000/api/auth/register",
+              {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
+                  email: "test@example.com", // Replace with actual user data
+                  userName: "testUser",
+                  fullName: "Test User",
+                  phone: "1234567890",
+                  password: "password123",
+                  recaptchaToken: recaptchaToken,
+                }),
+              }
+            );
+
+            const data = await response.json();
+            if (data.success) {
+              alert("Registration successful");
+            } else {
+              alert("Registration failed");
+            }
+          } catch (error) {
+            console.error("Error during registration:", error);
+            alert("Failed to register.");
+          }
+        });
+    </script>
+  </body>
+</html>

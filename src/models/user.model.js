@@ -3,14 +3,20 @@
 // ==============================
 import mongoose from "mongoose";
 import jwt from "jsonwebtoken";
+import axios from "axios";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
-import { StatusCodes } from "http-status-codes";
-import speakeasy from "speakeasy";
 import QRCode from "qrcode";
+import speakeasy from "speakeasy";
 import mongooseDelete from "mongoose-delete";
 import mongooseHidden from "mongoose-hidden";
+import { StatusCodes } from "http-status-codes";
 import uniqueValidator from "mongoose-unique-validator";
+
+// ==============================
+// Model
+// ==============================
+import Session from "./session.model.js";
 
 // ==============================
 // Utils
@@ -22,22 +28,33 @@ import ApiError from "../utils/apiError.js";
 // ==============================
 import {
   salt,
+  lockTime,
+  GoggleSecretKey,
   accessTokenSecret,
   refreshTokenSecret,
   accessTokenExpiresIn,
   refreshTokenExpiresIn,
+  otpExpiresInMs,
+  accessTokenTTL,
   maxLoginAttempt,
-  lockTime,
+  refreshTokenTTL,
+  tokenGracePeriod,
+  passwordResetTokenTTL,
 } from "../constants/constant.js";
+import logger from "../logger/logger.js";
 
 // ==============================
-// Token BlackList Schema Definition
+// Token Blacklist Schema
 // ==============================
-
-const TokenBlacklistSchema = new mongoose.Schema({
-  token: { type: String, required: true, unique: true },
-  expiresAt: { type: Date, required: true },
-});
+const TokenBlacklistSchema = new mongoose.Schema(
+  {
+    token: { type: String, required: true, unique: true },
+    expiresAt: { type: Date, required: true },
+    reason: { type: String, default: "Unknown" },
+    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+  },
+  { timestamps: true }
+);
 
 export const TokenBlacklist = mongoose.model(
   "TokenBlacklist",
@@ -45,7 +62,7 @@ export const TokenBlacklist = mongoose.model(
 );
 
 // ==============================
-// Token Schema Definition
+// Token Schema
 // ==============================
 const TokenSchema = new mongoose.Schema(
   {
@@ -55,123 +72,152 @@ const TokenSchema = new mongoose.Schema(
       required: true,
     },
     token: { type: String, required: true },
+    tokenHash: { type: String, select: false },
     type: { type: String, enum: ["access", "refresh"], required: true },
-    expiresAt: {
-      type: Date,
-      required: true,
+    expiresAt: { type: Date, required: true },
+    isBlacklisted: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "TokenBlacklist",
+      default: null,
     },
+    revoked: { type: Boolean, default: false },
+    userAgent: { type: String },
+    ipAddress: { type: String },
+    location: { type: String },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: "Admin" },
   },
   { timestamps: true }
 );
 
 TokenSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+TokenSchema.index({ userId: 1, type: 1 });
+
+TokenSchema.pre("save", async function (next) {
+  if (this.isNew && this.type === "refresh") {
+    await mongoose
+      .model("Token")
+      .deleteMany({ userId: this.userId, type: "refresh" });
+  }
+  next();
+});
+
+TokenSchema.path("expiresAt").validate(
+  (value) => value > new Date(),
+  "expiresAt must be a future date"
+);
 
 export const Token = mongoose.model("Token", TokenSchema);
 
 // ==============================
-// User Schema Definition
+// User Schema
 // ==============================
 const UserSchema = new mongoose.Schema(
   {
     fullName: {
       type: String,
+      required: true,
       trim: true,
       lowercase: true,
-      required: [true, "Full name is required."],
-      minlength: [3, "Full name must be at least 3 characters long"],
-      maxlength: [100, "Full name cannot exceed 100 characters"],
+      minlength: 3,
+      maxlength: 100,
     },
     email: {
       type: String,
+      required: true,
+      unique: true,
       trim: true,
       lowercase: true,
-      required: [true, "Email is required."],
-      unique: true,
-      match: [/\S+@\S+\.\S+/, "Please enter a valid email address"],
+      match: [/\S+@\S+\.\S+/, "Invalid email address"],
     },
     userName: {
       type: String,
+      required: true,
+      unique: true,
       trim: true,
       lowercase: true,
-      required: [true, "Username is required."],
-      unique: true,
-      minlength: [3, "Username must be at least 3 characters long"],
-      maxlength: [30, "Username cannot exceed 30 characters."],
+      minlength: 3,
+      maxlength: 30,
     },
     phone: {
       type: String,
+      required: true,
       trim: true,
-      required: [true, "Phone number is required."],
-      match: [/^\d{10}$/, "Please enter a valid 10-digit phone number"],
+      match: [/^\d{10}$/, "Invalid 10-digit phone number"],
     },
     password: {
       type: String,
+      required: true,
       trim: true,
-      required: [true, "Password is required."],
-      minlength: [8, "Password must be at least 8 characters long"],
-      maxlength: [100, "Password cannot exceed 100 characters"],
+      minlength: 8,
+      maxlength: 100,
+      select: false,
       match: [
         /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[\W_]).{8,}$/,
-        "Password must be strong: at least 8 characters with uppercase, lowercase, number, and symbol.",
+        "Password must be strong (uppercase, lowercase, number, special char)",
       ],
-      select: false,
     },
-    passwordChangedAt: { type: Date },
+    passwordChangedAt: Date,
     passwordResetToken: {
       type: String,
       validate: {
-        validator: (value) => !value || value.length === 64,
-        message: "Invalid password reset token format.",
+        validator: (v) => !v || v.length === 64,
+        message: "Invalid token format.",
       },
     },
     passwordResetTokenExpiration: {
       type: Date,
+      default: () => new Date(Date.now() + passwordResetTokenTTL),
       validate: {
-        validator: (value) => !value || value > new Date(),
-        message: "Password reset token has expired.",
+        validator: (v) => !v || v > new Date(),
+        message: "Token expired.",
       },
     },
     passwordHistory: {
       type: [String],
-      select: false,
       default: [],
+      select: false,
       validate: {
-        validator: function (arr) {
-          return arr.length <= 5;
-        },
+        validator: (arr) => arr.length <= 5,
         message: "Password history exceeds limit.",
       },
     },
     otp: { type: String, select: false },
-    otpExpiry: { type: Date, select: false },
+    otpExpiry: {
+      type: Date,
+      default: () => new Date(Date.now() + otpExpiresInMs),
+      select: false,
+    },
+    otpAttempts: { type: Number, select: false },
     avatar: {
       url: {
         type: String,
         validate: {
-          validator: (value) =>
-            !value || /^https?:\/\/.*\.(jpg|jpeg|png|gif)$/i.test(value),
-          message: "Invalid avatar image URL format.",
+          validator: (v) =>
+            !v || /^https?:\/\/.*\.(jpg|jpeg|png|gif)$/i.test(v),
+          message: "Invalid avatar URL.",
         },
       },
-      publicId: { type: String },
+      publicId: String,
     },
     role: {
       type: String,
       enum: ["user", "admin", "superAdmin"],
       default: "user",
     },
-    isVerified: {
-      type: Boolean,
-      default: false,
-    },
-    loginAttempts: {
-      type: Number,
-      default: 0,
-    },
+    isVerified: { type: Boolean, default: false },
+    loginAttempts: { type: Number, default: 0 },
     lockUntil: { type: Date },
     twoFactorEnabled: { type: Boolean, default: false },
     twoFactorSecret: { type: String, select: false },
     qrCode: { type: String, select: false },
+    securityQuestions: [
+      {
+        question: String,
+        answer: String,
+      },
+    ],
+    token: { type: mongoose.Types.ObjectId, ref: "Token" },
+    session: { type: mongoose.Types.ObjectId, ref: "Session" },
     tokenVersion: { type: Number, default: 0 },
   },
   {
@@ -194,7 +240,7 @@ const UserSchema = new mongoose.Schema(
 );
 
 // ==============================
-// Index
+// Indexes
 // ==============================
 UserSchema.index({ email: 1 });
 UserSchema.index({ userName: 1 });
@@ -210,86 +256,72 @@ UserSchema.virtual("isLocked").get(function () {
 // ==============================
 // Plugins
 // ==============================
-UserSchema.plugin(mongooseDelete, {
-  deletedAt: true,
-  overrideMethods: "all",
-});
-
+UserSchema.plugin(mongooseDelete, { deletedAt: true, overrideMethods: "all" });
 UserSchema.plugin(mongooseHidden, {
-  hidden: {
-    password: true,
-    otp: true,
-    twoFactorSecret: true,
-    qrCode: true,
-    loginAttempts: true,
-    lockUntil: true,
-    passwordResetToken: true,
-    passwordResetTokenExpiration: true,
-  },
+  hidden: [
+    "password",
+    "otp",
+    "twoFactorSecret",
+    "qrCode",
+    "loginAttempts",
+    "lockUntil",
+    "passwordResetToken",
+    "passwordResetTokenExpiration",
+  ],
 });
-
-UserSchema.plugin(uniqueValidator, {
-  message: "{PATH} already exists.",
-});
+UserSchema.plugin(uniqueValidator, { message: "{PATH} already exists." });
 
 // ==============================
-// Pre-save Hook
+// Pre-save
 // ==============================
 UserSchema.pre("save", async function (next) {
   try {
-    // Only proceed if password is modified
     if (this.isModified("password")) {
-      // Validate password
-      if (!this.password) {
-        return next(
-          new ApiError(StatusCodes.BAD_REQUEST, "Password is required")
-        );
-      }
-
-      // Check if password is reused from history
       if (this.passwordHistory?.length > 0) {
-        const isReused = await Promise.all(
-          this.passwordHistory.map((oldHash) =>
-            bcrypt.compare(this.password, oldHash)
-          )
+        const reused = await Promise.all(
+          this.passwordHistory.map((old) => bcrypt.compare(this.password, old))
         );
-        if (isReused.includes(true)) {
+        if (reused.includes(true)) {
           return next(
             new ApiError(StatusCodes.BAD_REQUEST, "Password was used recently.")
           );
         }
       }
-
-      // Hash new password
       const saltRound = await bcrypt.genSalt(salt);
-      this.password = await bcrypt.hash(this.password, saltRound);
+      const hashed = await bcrypt.hash(this.password, saltRound);
+      this.password = hashed;
       this.passwordChangedAt = new Date();
-
-      // Update password history (limit to 5 most recent)
       this.passwordHistory = [
         this.password,
         ...(this.passwordHistory || []),
       ].slice(0, 5);
     }
-
-    // Only proceed if OTP is modified and exists
     if (this.isModified("otp") && this.otp) {
-      const saltRound = await bcrypt.genSalt(salt);
-      this.otp = await bcrypt.hash(this.otp, saltRound);
+      if (this.otpAttempts >= 5) {
+        throw new ApiError(
+          StatusCodes.TOO_MANY_REQUESTS,
+          "Too many OTP attempts"
+        );
+      }
+      this.otp = await bcrypt.hash(this.otp, await bcrypt.genSalt(salt));
+      this.otpExpiry = new Date(Date.now() + otpExpiresInMs);
     }
+    if (
+      this.isModified("securityQuestions") &&
+      this.securityQuestions?.length
+    ) {
+      const saltRound = await bcrypt.genSalt(salt);
 
-    // Validate user schema
-    const userJsonSchema = this.toJSONSchema();
-    const validate = ajv.compile(userJsonSchema);
-    if (!validate(this.toObject())) {
-      return next(
-        new ApiError(StatusCodes.BAD_REQUEST, validate.errors[0].message)
+      this.securityQuestions = await Promise.all(
+        this.securityQuestions.map(async (question) => {
+          const hashedAnswer = await bcrypt.hash(question.answer, saltRound);
+          return { ...question, answer: hashedAnswer };
+        })
       );
     }
-
     next();
-  } catch (error) {
-    next(error);
+  } catch (err) {
+    next(err);
   }
 });
 
@@ -297,31 +329,24 @@ UserSchema.pre("save", async function (next) {
 // Instance Methods
 // ==============================
 UserSchema.methods.comparePassword = async function (password) {
-  if (!this.password) {
-    throw new ApiError(
-      StatusCodes.INTERNAL_SERVER_ERROR,
-      "Password not set for this user."
-    );
-  }
-  const isMatch = await bcrypt.compare(password, this.password);
-  if (!isMatch) {
-    throw new ApiError(StatusCodes.UNAUTHORIZED, "Incorrect password.");
-  }
-  return true;
+  return bcrypt.compare(password, this.password);
 };
 
 UserSchema.methods.compareOTP = async function (otp) {
-  if (!this.otp) {
-    throw new ApiError(
-      StatusCodes.INTERNAL_SERVER_ERROR,
-      "OTP not set for this user."
-    );
+  return bcrypt.compare(otp, this.otp);
+};
+
+UserSchema.methods.compareSecurityAnswer = async function (
+  questionId,
+  providedAnswer
+) {
+  const question = this.securityQuestions.find(
+    (q) => q._id.toString() === questionId.toString()
+  );
+  if (!question) {
+    throw new ApiError(StatusCodes.NOT_FOUND, "Security question not found.");
   }
-  const isMatch = await bcrypt.compare(otp, this.otp);
-  if (!isMatch) {
-    throw new ApiError(StatusCodes.UNAUTHORIZED, "Incorrect OTP.");
-  }
-  return true;
+  return await bcrypt.compare(providedAnswer, question.answer);
 };
 
 UserSchema.methods.generateAccessToken = function () {
@@ -336,18 +361,90 @@ UserSchema.methods.generateAccessToken = function () {
       tokenVersion: this.tokenVersion,
     },
     accessTokenSecret,
-    { expiresIn: accessTokenExpiresIn }
+    {
+      expiresIn: accessTokenExpiresIn,
+      issuer: "lets-talk",
+      audience: this._id.toString(),
+    }
   );
 };
 
 UserSchema.methods.generateRefreshToken = function () {
-  return jwt.sign({ id: this._id }, refreshTokenSecret, {
-    expiresIn: refreshTokenExpiresIn,
-  });
+  return jwt.sign(
+    {
+      id: this._id,
+      fullName: this.fullName,
+      email: this.email,
+      userName: this.userName,
+      phone: this.phone,
+      role: this.role,
+      tokenVersion: this.tokenVersion,
+    },
+    refreshTokenSecret,
+    {
+      expiresIn: refreshTokenExpiresIn,
+      issuer: "lets-talk",
+      audience: this._id.toString(),
+    }
+  );
 };
 
 UserSchema.methods.generateCryptoToken = function () {
   return crypto.randomBytes(32).toString("hex");
+};
+
+UserSchema.methods.hashSessionToken = function (token) {
+  return crypto.createHash("sha256").update(token).digest("hex");
+};
+
+UserSchema.methods.enableTwoFactor = async function () {
+  // Generate TOTP secret
+  const secret = speakeasy.generateSecret({
+    name: `Let's Talk - ${this.email}`,
+    length: 32,
+  });
+
+  // Store secret but don't enable 2FA yet
+  this.twoFactorSecret = secret.base32;
+  this.twoFactorEnabled = false;
+
+  // Generate QR Code from otpauth URL
+  const qrCodeDataURL = await QRCode.toDataURL(secret.otpauth_url);
+
+  // Save user without triggering validation
+  await this.save({ validateBeforeSave: false });
+
+  return {
+    qrCodeDataURL,
+  };
+};
+
+UserSchema.methods.verifyAndEnableTwoFactor = async function (id, token) {
+  if (!mongoose.Types.ObjectId.isValid(id)) {
+    throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid Id.");
+  }
+
+  const user = await User.findById(id).select("+twoFactorSecret");
+
+  if (!user || !user.twoFactorSecret) {
+    throw new ApiError(StatusCodes.BAD_REQUEST, "2FA setup not initiated");
+  }
+
+  const verified = speakeasy.totp.verify({
+    secret: this.twoFactorSecret,
+    encoding: "base32",
+    token,
+    window: 1,
+  });
+
+  if (!verified) {
+    throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid verification code");
+  }
+
+  user.twoFactorEnabled = true;
+  this.qrCode = undefined;
+  await this.save({ validateBeforeSave: false });
+  return { success: true };
 };
 
 UserSchema.methods.incLoginAttempts = async function () {
@@ -369,10 +466,6 @@ UserSchema.methods.resetLoginAttempts = async function () {
   await this.save({ validateBeforeSave: false });
 };
 
-UserSchema.methods.revokeTokens = async function () {
-  await Token.deleteMany({ userId: this._id });
-};
-
 UserSchema.methods.changedPasswordAfter = function (JWTTimestamp) {
   if (this.passwordChangedAt) {
     const changedTimestamp = parseInt(
@@ -384,20 +477,33 @@ UserSchema.methods.changedPasswordAfter = function (JWTTimestamp) {
   return false;
 };
 
-UserSchema.methods.verifyTwoFactorCode = async function (user, token) {
-  const isVerified = speakeasy.totp.verify({
-    secret: user.twoFactorSecret,
-    encoding: "base32",
-    token,
-  });
-  if (!isVerified) {
-    throw new ApiError(StatusCodes.UNAUTHORIZED, "Invalid 2FA code.");
-  }
-  return true;
+UserSchema.methods.isPasswordInHistory = async function (newPassword) {
+  const reused = await Promise.all(
+    this.passwordHistory.map((oldHash) => bcrypt.compare(newPassword, oldHash))
+  );
+  return reused.includes(true); // Return true if password matches any history
+};
+
+UserSchema.methods.revokeTokens = async function () {
+  await Token.deleteMany({ userId: this._id });
+  await TokenBlacklist.deleteMany({ userId: this._id });
+};
+
+UserSchema.methods.isTokenExpiredGracefully = function (expirationTimestamp) {
+  if (!expirationTimestamp) return false;
+  const now = Date.now();
+  return (
+    now > expirationTimestamp && now - expirationTimestamp <= tokenGracePeriod
+  );
+};
+
+UserSchema.methods.resetOtpAttempts = async function () {
+  this.otpAttempts = 0;
+  await this.save({ validateBeforeSave: false });
 };
 
 // ==============================
-// Static Methods
+// Instance Statics
 // ==============================
 UserSchema.statics.generateToken = async function (id) {
   if (!mongoose.Types.ObjectId.isValid(id)) {
@@ -414,42 +520,103 @@ UserSchema.statics.generateToken = async function (id) {
 
   const now = Date.now();
 
+  const accessTokenExpiresAt = new Date(now + accessTokenTTL);
+  const refreshTokenExpiresAt = new Date(now + refreshTokenTTL);
+
+  const hashToken = crypto
+    .createHash("sha256")
+    .update(refreshToken)
+    .digest("hex");
+
   await Token.create([
     {
       userId: user._id,
       token: accessToken,
       type: "access",
-      expiresAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      expiresAt: accessTokenExpiresAt,
     },
     {
       userId: user._id,
-      token: refreshToken,
+      token: hashToken,
+      tokenHash: hashToken,
       type: "refresh",
-      expiresAt: new Date(Date.now() + 1 * 24 * 60 * 60 * 1000),
+      expiresAt: refreshTokenExpiresAt,
     },
   ]);
 
   return { accessToken, refreshToken };
 };
 
-UserSchema.statics.generateTwoFactorAuth = async function (user) {
-  const secret = speakeasy.generateSecret({
-    length: 20,
-    name: `chatty (${user.email})`,
+UserSchema.statics.rotateTokens = async function (token, req) {
+  const decoded = jwt.verify(token, refreshTokenSecret);
+  const user = await this.findById(decoded.id);
+
+  if (!user) {
+    throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
+  }
+
+  // Generate new tokens
+  const accessToken = user.generateAccessToken();
+  const refreshToken = user.generateRefreshToken(req);
+
+  const now = Date.now();
+  const accessTokenExpiresAt = new Date(now + accessTokenTTL);
+  const refreshTokenExpiresAt = new Date(now + refreshTokenTTL);
+
+  // Hash the new refresh token and store it
+  const hashToken = crypto
+    .createHash("sha256")
+    .update(refreshToken)
+    .digest("hex");
+
+  // Invalidate old refresh token
+  await Token.deleteOne({
+    userId: user._id,
+    tokenHash: crypto.createHash("sha256").update(refreshToken).digest("hex"),
   });
 
-  user.twoFactorSecret = secret.base32;
-  user.twoFactorEnabled = true;
-  await user.save();
+  // Store new access and refresh tokens
+  await Token.create([
+    {
+      userId: user._id,
+      token: accessToken,
+      type: "access",
+      expiresAt: accessTokenExpiresAt,
+    },
+    {
+      userId: user._id,
+      token: hashToken,
+      tokenHash: hashToken,
+      type: "refresh",
+      expiresAt: refreshTokenExpiresAt,
+    },
+  ]);
 
-  const qrCodeUrl = await QRCode.toDataURL(secret.otpauth_url);
+  return { accessToken, refreshToken };
+};
 
-  return { qrCodeUrl, secret };
+UserSchema.statics.verifyRecaptcha = async function (recaptchaToken) {
+  const secretKey = GoggleSecretKey;
+  const url = `https://www.google.com/recaptcha/api/siteverify`;
+
+  try {
+    const response = await axios.post(url, null, {
+      params: {
+        secret: secretKey,
+        response: recaptchaToken,
+      },
+    });
+
+    return response.data;
+  } catch (error) {
+    logger.error("ReCAPTCHA verification error:", error);
+    throw new ApiError(StatusCodes.INTERNAL_SERVER_ERROR, error);
+  }
 };
 
 // ==============================
-// Model Export
+// Export
 // ==============================
-const User = mongoose.model("User", UserSchema);
 
+const User = mongoose.model("User", UserSchema);
 export default User;

@@ -12,7 +12,7 @@ import UsersController from "../../controllers/users/users.controller.js";
 // Middleware
 // ==============================
 import upload from "../../middleware/multer.middleware.js";
-import authMiddleware from "../../middleware/authMiddleware.middleware.js";
+import authMiddleware from "../../middleware/auth/authMiddleware.middleware.js";
 
 const router = express.Router();
 

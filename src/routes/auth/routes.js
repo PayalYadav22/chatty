@@ -14,8 +14,15 @@ import AuthController from "../../controllers/auth/auth.controller.js";
 import upload from "../../middleware/multer.middleware.js";
 import {
   registerLimiter,
-  authLimiter,
+  loginLimiter,
+  forgotPasswordLimiter,
+  generalLimiter,
 } from "../../middleware/rateLimiter.middleware.js";
+import authMiddleware from "../../middleware/auth/authMiddleware.middleware.js";
+import {
+  isAdminOrSuperAdmin,
+  isSuperAdmin,
+} from "../../middleware/auth/roleMiddleware.js";
 
 const router = express.Router();
 
@@ -33,14 +40,21 @@ router
  * @desc    Verify a new user email with OTP
  * @access  Public
  */
-router.route("/verify-email").post(AuthController.verifyUser);
+router.route("/verify-email").post(generalLimiter, AuthController.verifyUser);
 
 /**
  * @route   POST /api/v1/auth/login
  * @desc    Log in an existing user
  * @access  Public
  */
-router.route("/login").post(authLimiter, AuthController.loginUser);
+router.route("/login").post(loginLimiter, AuthController.loginUser);
+
+/**
+ * @route   POST /api/v1/auth/resend-otp
+ * @desc    Resend OTP for email verification
+ * @access  Public
+ */
+router.route("/resend-otp").post(generalLimiter, AuthController.resendOTP);
 
 /**
  * @route   POST /api/v1/auth/forgot-password
@@ -49,27 +63,178 @@ router.route("/login").post(authLimiter, AuthController.loginUser);
  */
 router
   .route("/forgot-password")
-  .post(authLimiter, AuthController.forgotUserPassword);
+  .post(forgotPasswordLimiter, AuthController.forgotUserPassword);
+
+/**
+ * @route   POST /api/v1/auth/verify-security-question
+ * @desc    Verify security question answer to proceed with password reset
+ * @access  Public
+ */
+router
+  .route("/verify-security-question")
+  .post(generalLimiter, AuthController.verifySecurityQuestion);
+
+/**
+ * @route   POST /api/v1/auth/reset-password-otp
+ * @desc    Reset user password using valid OTP
+ * @access  Public
+ */
+router
+  .route("/reset-password-otp")
+  .post(generalLimiter, AuthController.resetUserPasswordWithOTP);
 
 /**
  * @route   POST /api/v1/auth/reset-password/:token
  * @desc    Reset user password using valid token
  * @access  Public
  */
-router.route("/reset-password/:token").post(AuthController.resetUserPassword);
+router
+  .route("/reset-password/:token")
+  .post(generalLimiter, AuthController.resetUserPasswordWithToken);
 
 /**
  * @route   POST /api/v1/auth/refresh-token
  * @desc    Refresh JWT access token using refresh token
  * @access  Public
  */
-router.route("/refresh-token").post(AuthController.refreshUserToken);
+router
+  .route("/refresh-token")
+  .get(generalLimiter, AuthController.refreshUserToken);
+
+// ==============================
+// Secure Routes
+// ==============================
+router.use(authMiddleware);
 
 /**
- * @route   POST /api/v1/auth/block-token
- * @desc    Blacklist a JWT refresh/access token to prevent further use
- * @access  Public
+ * @route   POST /api/v1/auth/logout
+ * @desc    Log out the authenticated user and blacklist their JWT token
+ * @access  Private
  */
-router.route("/block-token").post(AuthController.blacklistToken);
+router.route("/logout").get(generalLimiter, AuthController.logoutUser);
+
+// ==============================
+// Token Blacklist Routes
+// ==============================
+
+/**
+ * @route   GET /api/v1/token/blacklist
+ * @desc    Get all blacklisted tokens
+ * @access  Private (Admin or Super Admin)
+ */
+router
+  .route("/token/blacklist")
+  .get(
+    isAdminOrSuperAdmin,
+    generalLimiter,
+    AuthController.getAllBlacklistedTokens
+  );
+
+/**
+ * @route   DELETE /api/v1/token/blacklist
+ * @desc    Remove a token from the blacklist
+ * @access  Private (Admin or Super Admin)
+ */
+router
+  .route("/token/blacklist")
+  .delete(isSuperAdmin, generalLimiter, AuthController.removeBlacklistToken);
+
+/**
+ * @route   GET /api/v1/token/blacklist/count
+ * @desc    Get count of blacklisted tokens
+ * @access  Private (Admin or Super Admin)
+ */
+router
+  .route("/token/blacklist/count")
+  .get(isAdminOrSuperAdmin, generalLimiter, AuthController.getBlacklistCount);
+
+/**
+ * @route   POST /api/v1/token/blacklist/check
+ * @desc    Check if a token is blacklisted
+ * @access  Private
+ */
+router
+  .route("/token/blacklist/check")
+  .post(isAdminOrSuperAdmin, generalLimiter, AuthController.isTokenBlacklisted);
+
+// ==============================
+// Session Routes
+// ==============================
+
+/**
+ * @route   POST /api/v1/session
+ * @desc    Create a new session for a user
+ * @access  Private
+ */
+router
+  .route("/session")
+  .post(isSuperAdmin, generalLimiter, AuthController.createSession);
+
+/**
+ * @route   GET /api/v1/session/user/:userId
+ * @desc    Get all sessions for a specific user
+ * @access  Private (Admin or User)
+ */
+router
+  .route("/session/user/:userId")
+  .get(isAdminOrSuperAdmin, generalLimiter, AuthController.getSessionsForUser);
+
+/**
+ * @route   GET /api/v1/session/:sessionId
+ * @desc    Get a session by its ID
+ * @access  Private
+ */
+router
+  .route("/session/:sessionId")
+  .get(isAdminOrSuperAdmin, generalLimiter, AuthController.getSessionById);
+
+/**
+ * @route   PATCH /api/v1/session/invalidate/:sessionId
+ * @desc    Invalidate a specific session
+ * @access  Private (Admin or User)
+ */
+router
+  .route("/session/invalidate/:sessionId")
+  .patch(isSuperAdmin, generalLimiter, AuthController.invalidateSession);
+
+/**
+ * @route   DELETE /api/v1/session/:sessionId
+ * @desc    Delete a specific session
+ * @access  Private (Admin or User)
+ */
+router
+  .route("/session/:sessionId")
+  .delete(isSuperAdmin, generalLimiter, AuthController.deleteSession);
+
+/**
+ * @route   GET /api/v1/session/active/count
+ * @desc    Get the count of active sessions
+ * @access  Private (Admin)
+ */
+router
+  .route("/session/active/count")
+  .get(
+    isAdminOrSuperAdmin,
+    generalLimiter,
+    AuthController.getActiveSessionCount
+  );
+
+/**
+ * @route   DELETE /api/v1/session/logout/all
+ * @desc    Log out all sessions for the authenticated user
+ * @access  Private
+ */
+router
+  .route("/session/logout/all")
+  .delete(isSuperAdmin, generalLimiter, AuthController.logoutAllSessions);
+
+/**
+ * @route   DELETE /api/v1/session/cleanup/expired
+ * @desc    Clean up expired sessions
+ * @access  Private (Admin)
+ */
+router
+  .route("/session/cleanup/expired")
+  .delete(isSuperAdmin, generalLimiter, AuthController.cleanupExpiredSessions);
 
 export default router;
