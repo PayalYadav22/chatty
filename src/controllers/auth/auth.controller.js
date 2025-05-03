@@ -52,6 +52,7 @@ import {
 // Logger
 // ==============================
 import logger from "../../logger/logger.js";
+import { validate } from "moongose/models/user_model.js";
 
 const AuthController = {
   // ==============================
@@ -1595,14 +1596,355 @@ const AuthController = {
   // ==============================
   // Session Controller
   // ==============================
-  createSession: asyncHandler(async (req, res) => {}),
-  getSessionsForUser: asyncHandler(async (req, res) => {}),
-  getSessionById: asyncHandler(async (req, res) => {}),
-  invalidateSession: asyncHandler(async (req, res) => {}),
-  deleteSession: asyncHandler(async (req, res) => {}),
-  getActiveSessionCount: asyncHandler(async (req, res) => {}),
-  logoutAllSessions: asyncHandler(async (req, res) => {}),
-  cleanupExpiredSessions: asyncHandler(async (req, res) => {}),
+  createSession: asyncHandler(async (req, res) => {
+    // Step 1: Extract Authenticated User & Refresh Token
+    const user = req.user;
+    const { refreshToken } = req.body;
+
+    // Step 2: Validate Refresh Token
+    if (!refreshToken) {
+      // Log failure due to missing refresh token
+      await createAuditLog({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "Session",
+        eventType: "SESSION_CREATE",
+        description: "Session creation failed: Refresh token is missing.",
+        req,
+      });
+
+      // Throw validation error
+      throw new ApiError(StatusCodes.BAD_REQUEST, "Refresh token is required.");
+    }
+
+    // Step 3: Create Session
+    const session = await createSession({
+      user,
+      refreshToken,
+      sessionExpiry,
+      req,
+    });
+
+    // Step 4: Audit Log for Successful Session Creation
+    await createAuditLog({
+      actorId: user._id,
+      targetId: session._id,
+      targetModel: "Session",
+      eventType: "SESSION_CREATE",
+      description:
+        "Session created successfully: New session created for user.",
+      req,
+    });
+
+    // Step 5: Send Success Response
+    return new ApiResponse(
+      StatusCodes.CREATED,
+      {
+        sessionId: session._id,
+        deviceFingerprint: session.deviceFingerprint,
+        expiresAt: session.expiresAt,
+      },
+      "Session created successfully: New session created for user."
+    ).send(res);
+  }),
+
+  getSessionsForUser: asyncHandler(async (req, res) => {
+    // Step 1: Extract Authenticated User
+    const user = req.user;
+
+    // Step 2: Fetch Active Sessions
+    const sessions = await Session.find({
+      userId: user._id,
+      isValid: true,
+      expiresAt: { $gt: new Date() },
+    })
+      .sort({ createdAt: -1 })
+      .select("-refreshTokenHash")
+      .lean();
+
+    // Step 3: Log Session Retrieval
+    await createAuditLog({
+      actorId: user._id,
+      targetId: user._id,
+      targetModel: "Session",
+      eventType: "SESSION_LIST",
+      description: "Session list fetched: Retrieved active sessions for user.",
+      req,
+    });
+
+    // Step 4: Respond with Sessions
+    return new ApiResponse(
+      StatusCodes.OK,
+      { sessions },
+      "Active sessions retrieved successfully."
+    ).send(res);
+  }),
+
+  getSessionById: asyncHandler(async (req, res) => {
+    // Step 1: Extract User and Session ID
+    const user = req.user;
+    const { sessionId } = req.params;
+
+    // Step 2: Validate Session ID
+    if (!mongoose.Types.ObjectId.isValid(sessionId)) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid session ID.");
+    }
+
+    // Step 3: Find Session Belonging to User
+    const session = await Session.findOne({
+      _id: sessionId,
+      userId: user._id,
+    })
+      .select("-refreshTokenHash")
+      .lean();
+
+    // Step 4: Handle Session Not Found
+    if (!session) {
+      await createAuditLog({
+        actorId: user._id,
+        targetId: sessionId,
+        targetModel: "Session",
+        eventType: "SESSION_VIEW_FAIL",
+        description:
+          "Session view failed: Session not found or does not belong to the user.",
+        req,
+      });
+
+      throw new ApiError(
+        StatusCodes.NOT_FOUND,
+        "Session view failed: Session not found or does not belong to the user."
+      );
+    }
+
+    // Step 5: Audit Log for Viewing Session
+    await createAuditLog({
+      actorId: user._id,
+      targetId: session._id,
+      targetModel: "Session",
+      eventType: "SESSION_VIEW",
+      description: "Session view successful: Viewed specific session by ID.",
+      req,
+    });
+
+    // Step 6: Respond with Session Details
+    return new ApiResponse(
+      StatusCodes.OK,
+      { session },
+      "Session view successful: Session details retrieved successfully."
+    ).send(res);
+  }),
+
+  invalidateSession: asyncHandler(async (req, res) => {
+    // Step 1: Extract User & Session ID
+    const user = req.user;
+    const { sessionId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(sessionId)) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid session ID.");
+    }
+
+    // Step 2: Find Session for the User
+    const session = await Session.findOne({
+      _id: sessionId,
+      userId: user._id,
+      isValid: true,
+    });
+
+    // Step 3: Handle If Session is Not Found or Already Invalid
+    if (!session) {
+      await createAuditLog({
+        actorId: user._id,
+        targetId: sessionId,
+        targetModel: "Session",
+        eventType: "SESSION_INVALIDATE_FAIL",
+        description:
+          "Session invalidate failed: Session not found or already invalid.",
+        req,
+      });
+
+      throw new ApiError(
+        StatusCodes.NOT_FOUND,
+        "Session invalidate failed: Session not found or already invalid."
+      );
+    }
+
+    // Step 4: Invalidate the Session
+    session.isValid = false;
+    await session.save({ validateBeforeSave: false });
+
+    // Step 5: Audit Log for Invalidating Session
+    await createAuditLog({
+      actorId: user._id,
+      targetId: session._id,
+      targetModel: "Session",
+      eventType: "SESSION_INVALIDATE",
+      description: `Session invalidated successful: Session ID ${sessionId} marked as invalid.`,
+      req,
+    });
+
+    // Step 6: Respond with Success
+    return new ApiResponse(
+      StatusCodes.OK,
+      {},
+      "Session invalidated successfully: Session marked as invalid."
+    ).send(res);
+  }),
+
+  deleteSession: asyncHandler(async (req, res) => {
+    // Step 1: Extract User & Session ID
+    const user = req.user;
+    const { sessionId } = req.params;
+
+    if (!mongoose.Types.ObjectId.isValid(sessionId)) {
+      throw new ApiError(StatusCodes.BAD_REQUEST, "Invalid session Id.");
+    }
+
+    // Step 2: Find Session Belonging to User
+    const session = await Session.findOne({
+      _id: sessionId,
+      userId: user._id,
+    });
+
+    // Step 3: Handle Session Not Found
+    if (!session) {
+      await createAuditLog({
+        actorId: user._id,
+        targetId: sessionId,
+        targetModel: "Session",
+        eventType: "SESSION_DELETE_FAIL",
+        description: `Session delete failed: Session not found or does not belong to the user.`,
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.NOT_FOUND,
+        "Session delete failed: Session not found."
+      );
+    }
+
+    // Step 4: Delete Session
+    await session.remove(); // Corrected to remove the session
+
+    // Step 5: Audit Log for Successful Deletion
+    await createAuditLog({
+      actorId: user._id,
+      targetId: session._id,
+      targetModel: "Session",
+      eventType: "SESSION_DELETE",
+      description: "Session delete successful: Session deleted successfully.",
+      req,
+    });
+
+    // Step 6: Respond with Success
+    return new ApiResponse(
+      StatusCodes.OK,
+      null,
+      "Session deleted successfully."
+    ).send(res);
+  }),
+
+  getActiveSessionCount: asyncHandler(async (req, res) => {
+    // Step 1: Extract the User from the Request
+    const user = req.user;
+
+    // Step 2: Count Active Sessions
+    const sessionCount = await Session.countDocuments({
+      userId: user._id,
+      isValid: true,
+    });
+
+    // Step 2.1: If session count is not found (i.e., no active sessions)
+    if (!sessionCount) {
+      await createAuditLog({
+        actorId: req.user._id,
+        targetId: null,
+        targetModel: "Session",
+        eventType: "SESSION_COUNT_FAIL",
+        description: `Session retrieve failed: ${error.message}`,
+        req,
+      });
+
+      // Step 2.2: Throw an error if session retrieval fails
+      throw new ApiError(
+        StatusCodes.BAD_REQUEST,
+        `Session retrieve failed: ${error.message}`
+      );
+    }
+
+    // Step 3: Log success if session count retrieval is successful
+    await createAuditLog({
+      actorId: req.user._id,
+      targetId: req.user._id,
+      targetModel: "Session",
+      eventType: "SESSION_COUNT_SUCCESS",
+      description: `Session retrieve successful: Active session count retrieved successfully.`,
+      req,
+    });
+
+    // Step 4: Respond with the Active Session Count
+    return new ApiResponse(
+      StatusCodes.OK,
+      { sessionCount },
+      "Session retrieve successful: Active session count retrieved successfully."
+    ).send(res);
+  }),
+
+  logoutAllSessions: asyncHandler(async (req, res) => {
+    // Step 1: Extract the authenticated user from the request
+    const user = req.user;
+
+    // Step 2: Invalidate all active sessions for the user by setting `isValid` to false
+    await Session.updateMany(
+      { userId: user._id, isValid: true },
+      { $set: { isValid: false } }
+    );
+
+    // Step 3: Optionally delete all sessions from the database
+    await Session.deleteMany({ userId: user._id });
+
+    // Step 4: Log the logout event for auditing purposes
+    await createAuditLog({
+      actorId: user._id,
+      targetId: user._id,
+      targetModel: "Session",
+      eventType: "LOGOUT_ALL_SESSIONS",
+      description: `Session logout successful: All sessions for user ${user._id} have been logged out.`,
+      req,
+    });
+
+    // Step 5: Respond with a success message
+    return new ApiResponse(
+      StatusCodes.OK,
+      {},
+      "Session logout successful: All sessions have been logged out successfully."
+    ).send(res);
+  }),
+
+  cleanupExpiredSessions: asyncHandler(async (req, res) => {
+    // Step 1: Define the current timestamp
+    const now = new Date();
+
+    // Step 2: Delete sessions that are expired based on `expiresAt` field
+    const result = await Session.deleteMany({
+      expiresAt: { $lte: now },
+    });
+
+    // Step 3: Create an audit log for the cleanup operation
+    await createAuditLog({
+      actorId: req.user?._id || null,
+      targetId: null,
+      targetModel: "Session",
+      eventType: "SESSION_INVALIDATE",
+      description: `Expired session cleanup completed successfully. ${result.deletedCount} session(s) removed.`,
+      req,
+    });
+
+    // Step 4: Respond with the result
+    return new ApiResponse(
+      StatusCodes.OK,
+      { deletedSessions: result.deletedCount },
+      `Expired sessions cleaned up successfully.`
+    ).send(res);
+  }),
 };
 
 export default AuthController;
