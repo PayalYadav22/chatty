@@ -9,14 +9,12 @@
 - 2 Way Verification email verification
 - Brute-force protection
 - Password recovery
+- Session Management
 
 ## 2. User Profile Management
 
 - User registration and profile creation
 - Avatar upload (Cloudinary or similar)
-
-## PENDING
-
 - Profile update (username, avatar, bio, etc.)
 - Change password
 - Email verification

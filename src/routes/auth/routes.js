@@ -23,6 +23,15 @@ import {
   isAdminOrSuperAdmin,
   isSuperAdmin,
 } from "../../middleware/auth/roleMiddleware.js";
+import validateRequest from "../../middleware/validateRequest.middleware.js";
+
+// ==============================
+// Validations
+// ==============================
+import {
+  loginUserSchema,
+  registerUserSchema,
+} from "../../validations/auth.validation.js";
 
 const router = express.Router();
 
@@ -33,7 +42,12 @@ const router = express.Router();
  */
 router
   .route("/register")
-  .post(upload.single("avatar"), registerLimiter, AuthController.registerUser);
+  .post(
+    upload.single("avatar"),
+    registerLimiter,
+    validateRequest(registerUserSchema),
+    AuthController.registerUser
+  );
 
 /**
  * @route   POST /api/v1/auth/verify-email
@@ -47,7 +61,9 @@ router.route("/verify-email").post(generalLimiter, AuthController.verifyUser);
  * @desc    Log in an existing user
  * @access  Public
  */
-router.route("/login").post(loginLimiter, AuthController.loginUser);
+router
+  .route("/login")
+  .post(validateRequest(loginUserSchema), AuthController.loginUser);
 
 /**
  * @route   POST /api/v1/auth/resend-otp
@@ -61,9 +77,7 @@ router.route("/resend-otp").post(generalLimiter, AuthController.resendOTP);
  * @desc    Initiate password reset by sending email to user
  * @access  Public
  */
-router
-  .route("/forgot-password")
-  .post(forgotPasswordLimiter, AuthController.forgotUserPassword);
+router.route("/forgot-password").post(AuthController.forgotUserPassword);
 
 /**
  * @route   POST /api/v1/auth/verify-security-question
@@ -101,17 +115,17 @@ router
   .route("/refresh-token")
   .get(generalLimiter, AuthController.refreshUserToken);
 
+/**
+ * @route   POST /api/v1/auth/logout
+ * @desc    Log out the authenticated user and blacklist their JWT token
+ * @access  Public
+ */
+router.route("/logout").get(generalLimiter, AuthController.logoutUser);
+
 // ==============================
 // Secure Routes
 // ==============================
 router.use(authMiddleware);
-
-/**
- * @route   POST /api/v1/auth/logout
- * @desc    Log out the authenticated user and blacklist their JWT token
- * @access  Private
- */
-router.route("/logout").get(generalLimiter, AuthController.logoutUser);
 
 // ==============================
 // Token Blacklist Routes
@@ -148,15 +162,6 @@ router
   .route("/token/blacklist/count")
   .get(isAdminOrSuperAdmin, generalLimiter, AuthController.getBlacklistCount);
 
-/**
- * @route   POST /api/v1/token/blacklist/check
- * @desc    Check if a token is blacklisted
- * @access  Private
- */
-router
-  .route("/token/blacklist/check")
-  .post(isAdminOrSuperAdmin, generalLimiter, AuthController.isTokenBlacklisted);
-
 // ==============================
 // Session Routes
 // ==============================
@@ -176,7 +181,7 @@ router
  * @access  Private (Admin or User)
  */
 router
-  .route("/session/user/:userId")
+  .route("/session")
   .get(isAdminOrSuperAdmin, generalLimiter, AuthController.getSessionsForUser);
 
 /**
@@ -195,7 +200,7 @@ router
  */
 router
   .route("/session/invalidate/:sessionId")
-  .patch(isSuperAdmin, generalLimiter, AuthController.invalidateSession);
+  .get(isSuperAdmin, generalLimiter, AuthController.invalidateSession);
 
 /**
  * @route   DELETE /api/v1/session/:sessionId

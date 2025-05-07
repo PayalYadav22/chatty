@@ -1,8 +1,17 @@
 // ==============================
+// External Package
+// ==============================
+import { UAParser } from "ua-parser-js";
+
+// ==============================
 // Model
 // ==============================
-import AuditLog from "../models/auditLogin.model.js";
-import { UAParser } from "ua-parser-js";
+import ActivityLog from "../models/activityLogin.model.js";
+
+// ==============================
+// logger
+// ==============================
+import logger from "../logger/logger.js";
 
 // ==============================
 // Helper Function for Device Parsing
@@ -20,7 +29,7 @@ function parseDevice(userAgent) {
 // ==============================
 // Request Meta Data
 // ==============================
-const extractRequestMetadata = (req, changes = {}) => {
+const extractRequestMetadata = (req, additionalData = {}) => {
   const ip = req?.ip || null;
   const userAgent = req?.get("User-Agent") || null;
   const deviceInfo = userAgent ? parseDevice(userAgent) : {};
@@ -34,30 +43,41 @@ const extractRequestMetadata = (req, changes = {}) => {
     device: deviceInfo.device,
     os: deviceInfo.os,
     browser: deviceInfo.browser,
-    changes,
+    additionalData,
   };
 };
 
-const createAuditLog = async ({
-  actorId,
-  targetId,
-  targetModel,
-  eventType,
-  description,
-  changes = {},
+// ==============================
+// Create Activity Log Entry
+// ==============================
+const createActivityLog = async ({
+  userId,
+  action,
+  description = "",
+  target = null,
   req,
+  additionalData = {},
 }) => {
-  await AuditLog.create({
-    actorId,
-    targetId,
-    targetModel,
-    eventType,
-    description,
-    metadata: extractRequestMetadata(req, changes),
-  });
+  if (!userId || !action) return;
+
+  try {
+    await ActivityLog.create({
+      userId,
+      action,
+      description,
+      target,
+      metadata: extractRequestMetadata(req, additionalData),
+    });
+  } catch (error) {
+    logger.error("Failed to create audit log:", error);
+    throw new ApiError(
+      StatusCodes.INTERNAL_SERVER_ERROR,
+      "Error creating audit log."
+    );
+  }
 };
 
 // ==============================
 // Export
 // ==============================
-export default createAuditLog;
+export default createActivityLog;

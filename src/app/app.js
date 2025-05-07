@@ -7,6 +7,8 @@ import session from "express-session";
 import router from "../routes/routes.js";
 import MongoStore from "connect-mongo";
 import attachRequestMeta from "../middleware/requestMeta.middleware.js";
+import notFound from "../middleware/notFound.middleware.js";
+import errorHandler from "../middleware/errorHandler.middleware.js";
 import { SessionSecretKey, mongoUrl, options } from "../constants/constant.js";
 
 const app = express();
@@ -63,6 +65,9 @@ app.use(express.json());
 
 // Your API routes
 app.use("/api/v1", router);
+
+app.use(notFound);
+app.use(errorHandler);
 
 // Setup Socket.io with CORS
 const io = new Server(server, {

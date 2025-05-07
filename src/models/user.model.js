@@ -17,6 +17,7 @@ import uniqueValidator from "mongoose-unique-validator";
 // Model
 // ==============================
 import Session from "./session.model.js";
+import TokenBlacklist from "./tokenBlacklist.model.js";
 
 // ==============================
 // Utils
@@ -42,24 +43,6 @@ import {
   passwordResetTokenTTL,
 } from "../constants/constant.js";
 import logger from "../logger/logger.js";
-
-// ==============================
-// Token Blacklist Schema
-// ==============================
-const TokenBlacklistSchema = new mongoose.Schema(
-  {
-    token: { type: String, required: true, unique: true },
-    expiresAt: { type: Date, required: true },
-    reason: { type: String, default: "Unknown" },
-    userId: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
-  },
-  { timestamps: true }
-);
-
-export const TokenBlacklist = mongoose.model(
-  "TokenBlacklist",
-  TokenBlacklistSchema
-);
 
 // ==============================
 // Token Schema
@@ -218,6 +201,10 @@ const UserSchema = new mongoose.Schema(
     ],
     token: { type: mongoose.Types.ObjectId, ref: "Token" },
     session: { type: mongoose.Types.ObjectId, ref: "Session" },
+    tokenExpirationTime: {
+      type: Date,
+      default: null,
+    },
     tokenVersion: { type: Number, default: 0 },
   },
   {
@@ -489,11 +476,14 @@ UserSchema.methods.revokeTokens = async function () {
   await TokenBlacklist.deleteMany({ userId: this._id });
 };
 
-UserSchema.methods.isTokenExpiredGracefully = function (expirationTimestamp) {
-  if (!expirationTimestamp) return false;
-  const now = Date.now();
+UserSchema.methods.isTokenExpiredGracefully = function (expirationTime) {
+  if (!expirationTime) return false;
+  const now = new Date();
+  const tokenExpiration = new Date(expirationTime);
+  const gracePeriod = 5 * 60 * 1000;
   return (
-    now > expirationTimestamp && now - expirationTimestamp <= tokenGracePeriod
+    now > tokenExpiration &&
+    now < new Date(tokenExpiration.getTime() + gracePeriod)
   );
 };
 
@@ -619,4 +609,5 @@ UserSchema.statics.verifyRecaptcha = async function (recaptchaToken) {
 // ==============================
 
 const User = mongoose.model("User", UserSchema);
+
 export default User;

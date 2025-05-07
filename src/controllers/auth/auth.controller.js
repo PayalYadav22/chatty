@@ -1,6 +1,7 @@
 // ==============================
 // External Packages
 // ==============================
+import mongoose from "mongoose";
 import { StatusCodes } from "http-status-codes";
 import jwt from "jsonwebtoken";
 import crypto from "crypto";
@@ -10,15 +11,12 @@ import crypto from "crypto";
 // ==============================
 import User from "../../models/user.model.js";
 import Session from "../../models/session.model.js";
-import { TokenBlacklist } from "../../models/user.model.js";
+import TokenBlacklist from "../../models/tokenBlacklist.model.js";
 
 // ==============================
 // Middleware
 // ==============================
 import asyncHandler from "../../middleware/asyncHandler.middleware.js";
-import createAuditLog from "../../middleware/auditLogger.middleware.js";
-import logLoginAttempt from "../../middleware/loginLogger.middleware.js";
-import createSession from "../../middleware/createSession.middleware.js";
 
 // ==============================
 // Utils
@@ -27,6 +25,12 @@ import ApiError from "../../utils/apiError.js";
 import ApiResponse from "../../utils/apiResponse.js";
 import generateOTP from "../../utils/otp.js";
 import sendEmail from "../../utils/email.js";
+import {
+  logActivity,
+  logAudit,
+  logLoginAttempt,
+  logSession,
+} from "utils/logger.js";
 
 // ==============================
 // Config / Services
@@ -46,20 +50,20 @@ import {
   sessionExpiry,
   otpExpiresInMs,
   refreshTokenSecret,
+  logEvents,
 } from "../../constants/constant.js";
 
 // ==============================
 // Logger
 // ==============================
 import logger from "../../logger/logger.js";
-import { validate } from "moongose/models/user_model.js";
 
 const AuthController = {
   // ==============================
   // Authentication Controller
   // ==============================
   registerUser: asyncHandler(async (req, res) => {
-    // Extracting required fields from the request body
+    // Step 1: Extracting required fields from the request body
     const {
       fullName,
       email,
@@ -70,127 +74,119 @@ const AuthController = {
       securityQuestions,
     } = req.body;
 
-    // Step 1: Validate required fields (Full Name, Email, Phone, Username, Password)
-    if (
-      [fullName, email, phone, userName, password, securityQuestions].some(
-        (f) => !f
-      )
-    ) {
-      await createAuditLog({
+    // Step 2: Validate required fields (Full Name, Email, Phone, Username, Password)
+    if ([fullName, email, phone, userName, password].some((f) => !f)) {
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
+        eventType: logEvents.REGISTER_FAILED,
         description:
-          "Registration failed: Required registration fields are missing.",
+          "Registration failed: Missing required registration fields.",
         req,
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        `Registration failed: Please provide all the required fields (Full Name, Email, Phone, Username, Password).`
+        `Registration failed: Missing required registration fields.`
       );
     }
 
-    // Step 2: Validate reCAPTCHA token
+    // Step 3: Validate reCAPTCHA token presence
     if (!recaptchaToken) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
+        eventType: logEvents.REGISTER_FAILED,
         description: "Registration failed: Missing reCAPTCHA token.",
         req,
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Registration failed: The reCAPTCHA token is missing. Please complete the security verification to proceed with registration."
+        "Registration failed: Missing reCAPTCHA token."
       );
     }
 
-    // Step 3: Validate avatar file (ensure avatar image is uploaded)
+    // Step 4: Validate avatar file (ensure avatar image is uploaded)
     const avatarPath = req?.file?.path;
     if (!avatarPath) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
+        eventType: logEvents.REGISTER_FAILED,
         description: "Registration failed: Missing avatar image.",
         req,
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Registration failed: Avatar image is required. Please upload a valid avatar to complete the registration process."
+        "Registration failed: Missing avatar image."
       );
     }
 
-    // Step 4: Upload avatar image to Cloudinary
+    // Step 5: Upload avatar image to Cloudinary
     const avatar = await uploadFileToCloudinary(avatarPath);
-
-    // Check if avatar upload was successful
     if (!avatar) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
-        description:
-          "Registration failed: Avatar upload failed during registration.",
+        eventType: logEvents.REGISTER_FAILED,
+        description: "Registration failed: Avatar upload to Cloudinary failed.",
         req,
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Registration failed: Avatar upload failed. Please try again later or use a different image format."
+        "Registration failed: Avatar upload to Cloudinary failed."
       );
     }
 
-    // Step 5: Check if user already exists (based on email or phone)
+    // Step 6: Check if user already exists (based on email or phone)
     const existingUser = await User.findOne({
       $or: [{ email }, { phone }],
     });
 
-    // If the user already exists, log and throw an error
+    // Step 7: If the user already exists, log and throw an error
     if (existingUser) {
-      await createAuditLog({
-        actorId: null,
+      await logAudit({
+        actorId: existingUser._id,
         targetId: existingUser._id,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
+        eventType: logEvents.REGISTER_FAILED,
         description:
-          "Registration failed: Attempted registration with an already registered email, username, or phone number.",
+          "Registration failed: User with same email or phone already exists.",
         req,
       });
       throw new ApiError(
         StatusCodes.CONFLICT,
-        "Registration failed: The email, username, or phone number you provided is already in use. Please use a different one."
+        "Registration failed: User with same email or phone already exists."
       );
     }
 
-    // Step 6: Generate OTP and set expiry time for OTP
+    // Step 8: Generate OTP and set expiry time for OTP
     const otp = generateOTP();
     const otpExpiry = new Date(Date.now() + otpExpiresInMs);
 
-    // Step 7: Verify reCAPTCHA token
+    // Step 9: Verify reCAPTCHA token with Google
     const recaptchaResponse = await User.verifyRecaptcha(recaptchaToken);
 
-    // If reCAPTCHA verification fails, log and throw an error
+    // Step 10: If reCAPTCHA verification fails, log and throw an error
     if (!recaptchaResponse?.success) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
-        targetId: existingUser?._id || null,
+        targetId: null,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
-        description:
-          "Registration failed: Invalid or failed reCAPTCHA verification during registration.",
+        eventType: logEvents.REGISTER_FAILED,
+        description: "Registration failed: Invalid reCAPTCHA verification.",
         req,
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Registration failed: The reCAPTCHA response is invalid. Please try again."
+        "Registration failed: Invalid reCAPTCHA verification."
       );
     }
 
-    // Step 8: Create a new user in the database
+    // Step 11: Create a new user in the database with the provided and generated details
     const user = await User.create({
       fullName,
       email,
@@ -205,14 +201,16 @@ const AuthController = {
       otpExpiry,
       isVerified: false,
       twoFactorEnabled: false,
-      securityQuestions: securityQuestions,
+      securityQuestions: Array.isArray(securityQuestions)
+        ? securityQuestions
+        : [],
     });
 
-    // Step 9: Reset OTP attempts for the new user
+    // Step 12: Reset OTP attempts for the new user
     await user.resetOtpAttempts();
 
     try {
-      // Step 10: Send OTP email for email verification
+      // Step 13: Send OTP email for email verification
       await sendEmail({
         to: user.email,
         subject: "Email Verification",
@@ -220,18 +218,28 @@ const AuthController = {
         context: { name: user.fullName, otp, expiresIn: expireTime },
       });
 
-      // Step 11: Create a successful registration audit log
-      await createAuditLog({
+      // Step 14: Create a successful registration audit log
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "REGISTER_SUCCESS",
+        eventType: logEvents.REGISTER_SUCCESS,
         description:
-          "Registration  successful: User successfully completed the registration process. Please verify your email.",
+          "Registration successful: User successfully completed the registration process. Please verify your email.",
         req,
       });
 
-      // Step 12: Return success response with user details
+      // Step 15: Record an activity log entry for successful registration
+      await logActivity({
+        userId: user._id,
+        target: user._id,
+        action: logEvents.REGISTER_SUCCESS,
+        description:
+          "Registration successfully: User successfully completed the registration process. Please verify your email.",
+        req,
+      });
+
+      // Step 16: Return success response with user details
       return new ApiResponse(
         StatusCodes.CREATED,
         {
@@ -242,22 +250,26 @@ const AuthController = {
           avatar: user.avatar,
           role: user.role,
         },
-        "Registration successful: User successfully completed the registration process. Please verify your email."
+        "Registration successfully: User successfully completed the registration process. Please verify your email."
       ).send(res);
     } catch (error) {
-      // If an error occurs during email sending, clean up and handle errors
+      // Step 17: In case of error (e.g. email sending fails), cleanup and log failure
       await User.findByIdAndDelete(user._id);
       await deleteFileToCloudinary(avatar.publicId);
-      await createAuditLog({
+      logger.error(error);
+
+      // Step 18: Log audit entry for email sending failure
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "REGISTER_FAILED",
+        eventType: logEvents.REGISTER_FAILED,
         description:
-          "Registration failed: due to an error during the email verification process. Please try again later.",
+          "Registration failed: Email sending failed after registration.",
         req,
       });
 
+      // Step 19: Throw generic error to client
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
         "Registration failed: An error occurred during the email verification process. Please try again later."
@@ -270,16 +282,29 @@ const AuthController = {
 
     // Step 1: Validate required credentials
     if (!password || !twoFactorCode || (!email && !phone)) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "LOGIN_FAILED",
+        eventType: logEvents.LOGIN_FAILED,
         description: "Login attempt failed: Missing credentials.",
         req,
       });
+      await logActivity({
+        userId: null,
+        action: logEvents.LOGIN_FAILED,
+        description: "Login attempt failed: Missing credentials.",
+        req,
+      });
+      await logLoginAttempt({
+        user: null,
+        email: null,
+        success: false,
+        reason: `Login attempt failed: Missing credentials.`,
+        req,
+      });
       throw new ApiError(
-        StatusCodes.BAD_REQUEST,
+        StatusCodes.NOT_FOUND,
         "Login attempt failed: Missing credentials."
       );
     }
@@ -288,14 +313,21 @@ const AuthController = {
     const user = await User.findOne({ $or: [{ email }, { phone }] }).select(
       "+password +twoFactorSecret"
     );
-
     // Step 3: Handle user not found
     if (!user) {
-      await createAuditLog({
+      // Log failed login due to user not found
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "LOGIN_FAILED",
+        eventType: logEvents.LOGIN_FAILED,
+        description: `Login attempt failed: User not found for email: ${req.body.email}`,
+        req,
+      });
+
+      await logActivity({
+        userId: null,
+        action: logEvents.LOGIN_FAILED,
         description: `Login attempt failed: User not found for email: ${req.body.email}`,
         req,
       });
@@ -304,13 +336,13 @@ const AuthController = {
         user: null,
         email: req.body.email,
         success: false,
-        reason: "User not found",
+        reason: `Login attempt failed: User not found for email: ${req.body.email}`,
         req,
       });
 
       throw new ApiError(
         StatusCodes.UNAUTHORIZED,
-        "Authentication failed: User not found."
+        `Login attempt failed: User not found for email: ${req.body.email}`
       );
     }
 
@@ -320,7 +352,8 @@ const AuthController = {
     );
 
     if (isTokenExpiredGracefully) {
-      await createAuditLog({
+      // Log failed login due to token expired (within grace)
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
@@ -329,10 +362,24 @@ const AuthController = {
           "Login attempt failed: Token expired but within grace period, login attempt denied.",
         req,
       });
-
+      await logActivity({
+        userId: user._id,
+        action: "LOGIN_FAILED",
+        description:
+          "Login attempt failed: Token expired but within grace period, login attempt denied.",
+        req,
+      });
+      await logLoginAttempt({
+        user: user._id,
+        email: email,
+        success: false,
+        reason:
+          "Login attempt failed: Token expired but within grace period, login attempt denied.",
+        req,
+      });
       throw new ApiError(
         StatusCodes.UNAUTHORIZED,
-        "Login attempt failed: Token expired but within the grace period. Please request a new token."
+        "Login attempt failed: Token expired but within grace period, login attempt denied."
       );
     }
 
@@ -340,12 +387,28 @@ const AuthController = {
     const isValid = await user.comparePassword(password);
 
     if (!isValid) {
-      await createAuditLog({
+      // Log failed login due to invalid password
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "LOGIN_FAILED",
+        eventType: logEvents.LOGIN_FAILED,
         description: "Login attempt failed: Invalid password.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.LOGIN_FAILED,
+        description: "Login attempt failed: Invalid password.",
+        req,
+      });
+
+      await logLoginAttempt({
+        user: user._id,
+        email: email,
+        success: false,
+        reason: "Login attempt failed: Invalid password.",
         req,
       });
 
@@ -363,12 +426,32 @@ const AuthController = {
       const minutes = Math.ceil(lockDurationInMillis / 60000);
       const adjustedMinutes = minutes > 0 ? minutes : 0;
 
-      await createAuditLog({
+      // Log failed login due to account lock
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "LOGIN_FAILED",
+        eventType: logEvents.LOGIN_FAILED,
         description: `Login attempt failed: Account locked. Try again in ${adjustedMinutes} ${
+          adjustedMinutes === 1 ? "minute" : "minutes"
+        }.`,
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.LOGIN_FAILED,
+        description: `Login attempt failed: Account locked. Try again in ${adjustedMinutes} ${
+          adjustedMinutes === 1 ? "minute" : "minutes"
+        }.`,
+        req,
+      });
+
+      await logLoginAttempt({
+        user: user._id,
+        email: email,
+        success: false,
+        reason: `Login attempt failed: Account locked. Try again in ${adjustedMinutes} ${
           adjustedMinutes === 1 ? "minute" : "minutes"
         }.`,
         req,
@@ -384,33 +467,67 @@ const AuthController = {
 
     // Step 7: Check if email is verified
     if (!user.isVerified) {
-      await createAuditLog({
+      // Log failed login due to unverified email
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "LOGIN_FAILED",
+        eventType: logEvents.LOGIN_FAILED,
         description: "Login attempt failed: Email address not verified.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.LOGIN_FAILED,
+        description: "Login attempt failed: Email address not verified.",
+        req,
+      });
+
+      await logLoginAttempt({
+        user: user._id,
+        email: email,
+        success: false,
+        reason: "Login attempt failed: Email address not verified.",
         req,
       });
 
       throw new ApiError(
         StatusCodes.UNAUTHORIZED,
-        "Login failed: Your email address is not verified. Please verify your email to continue."
+        "Login attempt failed: Email address not verified."
       );
     }
 
     // Step 8: Reset login attempts after successful password validation
     await user.resetLoginAttempts();
 
-    // Step 9: verify 2FA code and enable two factor
+    // Step 9: Verify 2FA code and enable 2FA if not already enabled
     if (!user.twoFactorEnabled) {
       if (!twoFactorCode) {
-        await createAuditLog({
+        // Log failed login due to missing 2FA code
+        await logAudit({
           actorId: user._id,
           targetId: user._id,
           targetModel: "User",
-          eventType: "LOGIN_FAILED",
+          eventType: logEvents.LOGIN_FAILED,
           description:
+            "Login attempt failed: Two-Factor Authentication (2FA) code missing during login attempt.",
+          req,
+        });
+
+        await logActivity({
+          userId: user._id,
+          action: logEvents.LOGIN_FAILED,
+          description:
+            "Login attempt failed: Two-Factor Authentication (2FA) code missing during login attempt.",
+          req,
+        });
+
+        await logLoginAttempt({
+          user: user._id,
+          email: email,
+          success: false,
+          reason:
             "Login attempt failed: Two-Factor Authentication (2FA) code missing during login attempt.",
           req,
         });
@@ -427,12 +544,30 @@ const AuthController = {
       );
 
       if (!isValid2FA) {
-        await createAuditLog({
+        // Log failed login due to invalid 2FA code
+        await logAudit({
           actorId: user._id,
           targetId: user._id,
           targetModel: "User",
-          eventType: "LOGIN_FAILED",
+          eventType: logEvents.LOGIN_FAILED,
           description:
+            "Login attempt failed: Invalid 2FA code provided during login.",
+          req,
+        });
+
+        await logActivity({
+          userId: user._id,
+          action: logEvents.LOGIN_FAILED,
+          description:
+            "Login attempt failed: Invalid 2FA code provided during login.",
+          req,
+        });
+
+        await logLoginAttempt({
+          user: user._id,
+          email: email,
+          success: false,
+          reason:
             "Login attempt failed: Invalid 2FA code provided during login.",
           req,
         });
@@ -448,7 +583,7 @@ const AuthController = {
     const { accessToken, refreshToken } = await User.generateToken(user._id);
 
     // Step 11: Create session and set tokens in cookies
-    await createSession({
+    await logSession({
       user,
       refreshToken,
       sessionExpiry,
@@ -460,12 +595,27 @@ const AuthController = {
       .cookie("refreshToken", refreshToken, options);
 
     // Step 12: Log successful login
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "User",
-      eventType: "LOGIN_SUCCESS",
+      eventType: logEvents.LOGIN_SUCCESS,
       description: `Login Successful: User '${user.userName}' successfully logged in.`,
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.LOGIN_SUCCESS,
+      description: `Login Successful: User '${user.userName}' successfully logged in.`,
+      req,
+    });
+
+    await logLoginAttempt({
+      user: user._id,
+      email: email,
+      success: true,
+      reason: `Login Successful: User '${user.userName}' successfully logged in.`,
       req,
     });
 
@@ -486,17 +636,25 @@ const AuthController = {
   }),
 
   verifyUser: asyncHandler(async (req, res) => {
+    // Step 1: Extract email and OTP from the request body
     const { email, otp } = req.body;
 
-    // Step 1: Validate inputs
+    // Step 2: Validate required inputs (email and OTP)
     if (!email || !otp) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "VERIFIED_EMAIL_FAILED",
+        eventType: logEvents.VERIFIED_EMAIL_FAILED,
         description:
-          "Email verification failed: Missing required email or OTP.",
+          "Email verification failed: Please provide both your email and the OTP.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.VERIFIED_EMAIL_FAILED,
+        description:
+          "Email verification failed: Please provide both your email and the OTP.",
         req,
       });
       throw new ApiError(
@@ -505,7 +663,7 @@ const AuthController = {
       );
     }
 
-    // Step 2: Retrieve user by email and ensure OTP is valid and unexpired
+    // Step 3: Retrieve the user and ensure OTP is valid and not expired
     const user = await User.findOne({
       email: email.trim().toLowerCase(),
       otp: { $exists: true },
@@ -513,15 +671,67 @@ const AuthController = {
       isVerified: false,
     }).select("+otp +otpExpiry");
 
-    // Step 3: Verify that user exists and OTP matches
-    if (!user || !(await user.compareOTP(otp))) {
-      await createAuditLog({
+    // Step 4: Validate that user exists and OTP matches
+    if (!user) {
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "VERIFIED_EMAIL_FAILED",
+        eventType: logEvents.VERIFIED_EMAIL_FAILED,
+        description: "Email verification failed: User not found.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.VERIFIED_EMAIL_FAILED,
+        description: "Email verification failed: User not found.",
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.BAD_REQUEST,
+        "Email verification failed: User not found."
+      );
+    }
+
+    // Step 5: Check if user is already verified
+    if (user.isVerified) {
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.VERIFIED_EMAIL_FAILED,
+        description: "Email verification failed: User is already verified.",
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.VERIFIED_EMAIL_FAILED,
+        description: "Email verification failed: User is already verified.",
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.BAD_REQUEST,
+        "Email verification failed: User is already verified."
+      );
+    }
+
+    // Step 6: Compare the provided OTP with the user's saved OTP
+    const isValid = await user.compareOTP(otp);
+    if (!isValid) {
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.VERIFIED_EMAIL_FAILED,
         description:
-          "Email verification failed: Invalid or expired OTP entered.",
+          "Email verification failed: The OTP you entered is invalid or has expired. Please request a new one.",
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.VERIFIED_EMAIL_FAILED,
+        description:
+          "Email verification failed: The OTP you entered is invalid or has expired. Please request a new one.",
         req,
       });
       throw new ApiError(
@@ -530,42 +740,100 @@ const AuthController = {
       );
     }
 
-    // Step 4: Enable Two-Factor Authentication (2FA)
-    const twoFactorSetup = await user.enableTwoFactor();
+    // Step 7: Enable Two-Factor Authentication (2FA) and generate QR code
+    let twoFactorSetup;
+    try {
+      twoFactorSetup = await user.enableTwoFactor();
+    } catch (error) {
+      logger.error(error);
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.VERIFIED_EMAIL_FAILED,
+        description:
+          "Email verification failed: Failed to enable Two-Factor Authentication.",
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.VERIFIED_EMAIL_FAILED,
+        description:
+          "Email verification failed: Failed to enable Two-Factor Authentication.",
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "Email verification failed: Failed to enable Two-Factor Authentication."
+      );
+    }
 
+    // Step 8: Mark user as verified and clear OTP details
     user.isVerified = true;
     user.otp = undefined;
     user.otpExpiry = undefined;
 
-    await user.save({ validateBeforeSave: false });
-
-    // Step 5: Generate authentication tokens
+    // Step 9: Generate JWT tokens for the user
     const { accessToken, refreshToken } = await User.generateToken(user._id);
 
-    // Step 6: Create a session record and set session cookie
-    await createSession({
-      user,
-      refreshToken,
-      sessionExpiry,
-      req,
-    });
+    // Step 10: Create a session and store refresh token with session expiry
+    try {
+      await logSession({
+        user,
+        refreshToken,
+        sessionExpiry,
+        req,
+      });
+    } catch (error) {
+      logger.error(error);
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.VERIFIED_EMAIL_FAILED,
+        description: "Email verification failed: Session creation failed.",
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.VERIFIED_EMAIL_FAILED,
+        description: "Email verification failed: Session creation failed.",
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "Email verification failed: Session creation failed."
+      );
+    }
 
+    // Step 11: Save the updated user document
+    await user.save({ validateBeforeSave: false });
+
+    // Step 12: Set cookies for access and refresh tokens
     res
       .cookie("accessToken", accessToken, options)
       .cookie("refreshToken", refreshToken, options);
 
-    // Step 7: Audit log for successful verification
-    await createAuditLog({
+    // Step 13: Log successful email verification and 2FA setup
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "User",
-      eventType: "VERIFIED_EMAIL_SUCCESS",
+      eventType: logEvents.VERIFIED_EMAIL_SUCCESS,
       description:
         "Email successfully verified. Two-Factor Authentication setup initiated.",
       req,
     });
 
-    // Step 8: Respond with user details, tokens, and QR code
+    await logActivity({
+      userId: user._id,
+      action: logEvents.VERIFIED_EMAIL_SUCCESS,
+      description:
+        "Email successfully verified. Two-Factor Authentication setup initiated.",
+      req,
+    });
+
+    // Step 14: Send response with tokens and 2FA QR code
     return new ApiResponse(
       StatusCodes.OK,
       {
@@ -587,18 +855,25 @@ const AuthController = {
 
     // Step 1: Validate the presence of email
     if (!email) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
+        eventType: logEvents.FORGOT_PASSWORD_FAILED,
         description:
-          "Password reset request failed: Missing email address in the request payload.",
+          "Password forgot request failed: Missing email address in the request payload.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.FORGOT_PASSWORD_FAILED,
+        description:
+          "Password forgot request failed: Missing email address in the request payload.",
         req,
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        "Email address is required to request a password reset. Please provide a valid email."
+        "Password forgot request failed: Missing email address in the request payload."
       );
     }
 
@@ -607,17 +882,23 @@ const AuthController = {
 
     // Step 3: Handle case where user is not found
     if (!user) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: email,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
-        description: `Password reset request failed: No user found for the email address: ${email}.`,
+        eventType: logEvents.FORGOT_PASSWORD_FAILED,
+        description: `Password forgot request failed: No user found for the email address: ${email}.`,
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.FORGOT_PASSWORD_FAILED,
+        description: `Password forgot request failed: No user found for the email address: ${email}.`,
         req,
       });
       throw new ApiError(
         StatusCodes.NOT_FOUND,
-        `Password reset request failed: No user found associated with the provided email address.`
+        `Password forgot request failed: No user found for the email address: ${email}.`
       );
     }
 
@@ -647,27 +928,40 @@ const AuthController = {
         });
       } catch (error) {
         // Step 5.3: Handle session saving error
-        await createAuditLog({
+        logger.error("Session save error:", error);
+        await logAudit({
           actorId: null,
           targetId: null,
           targetModel: "User",
-          eventType: "PASSWORD_RESET_REQUEST_FAILED",
-          description: "Password reset request failed: Error saving session.",
+          eventType: logEvents.FORGOT_PASSWORD_FAILED,
+          description: "Password forgot request failed: Error saving session.",
           req,
         });
-        logger.error("Session save error:", error);
+        await logActivity({
+          userId: null,
+          action: logEvents.FORGOT_PASSWORD_FAILED,
+          description: "Password forgot request failed: Error saving session.",
+          req,
+        });
         throw new ApiError(
           StatusCodes.INTERNAL_SERVER_ERROR,
-          "Session could not be saved."
+          "Password forgot request failed: Error saving session."
         );
       }
 
       // Step 6: Log the security question prompt
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_SECURITY_QUESTION_PROMPTED",
+        eventType: logEvents.PASSWORD_RESET_SECURITY_QUESTION_PROMPTED,
+        description: `Security question prompt triggered for user: ${randomQuestion.question}`,
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.PASSWORD_RESET_SECURITY_QUESTION_PROMPTED,
         description: `Security question prompt triggered for user: ${randomQuestion.question}`,
         req,
       });
@@ -677,7 +971,7 @@ const AuthController = {
         StatusCodes.OK,
         {
           securityQuestion: randomQuestion.question,
-          resetToken: user.passwordResetToken, // Include reset token
+          resetToken: user.passwordResetToken,
         },
         "A security question has been prompted. Please answer it to proceed with your password reset."
       ).send(res);
@@ -708,12 +1002,19 @@ const AuthController = {
       });
 
       // Step 10: Log the successful email sending for audit
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_SUCCESS",
-        description: `Password reset link successfully sent to user’s email: ${user.email}`,
+        eventType: logEvents.FORGOT_PASSWORD_SUCCESS,
+        description: `Password reset request successfully: Password reset link successfully sent to user’s email: ${user.email}`,
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.FORGOT_PASSWORD_SUCCESS,
+        description: `Password reset request successfully: Password reset link successfully sent to user’s email: ${user.email}`,
         req,
       });
 
@@ -728,6 +1029,21 @@ const AuthController = {
     } catch (error) {
       // Step 12: Handle any errors during email sending
       logger.error(error);
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.FORGOT_PASSWORD_FAILED,
+        description: `Password reset request failed: An error occurred while processing your request. Please try again later.`,
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.FORGOT_PASSWORD_FAILED,
+        description: `Password reset request failed: An error occurred while processing your request. Please try again later.`,
+        req,
+      });
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
         `Password reset request failed: An error occurred while processing your request. Please try again later.`
@@ -736,19 +1052,24 @@ const AuthController = {
   }),
 
   verifySecurityQuestion: asyncHandler(async (req, res) => {
-    // Step 1: Extract required fields from request
     const { answer, resetToken } = req.body;
-    const questionId = req.session.resetQuestion;
+    const questionId = req.session?.resetQuestion || req.body.testQuestionId;
 
-    // Step 2: Validate presence of required fields
     if (!answer || !resetToken || !questionId) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
+        eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
         description:
-          "Security question verification failed: Missing required fields in request payload.",
+          "Missing fields in security question verification request.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description:
+          "Missing fields in security question verification request.",
         req,
       });
       throw new ApiError(
@@ -757,20 +1078,23 @@ const AuthController = {
       );
     }
 
-    // Step 3: Find user by password reset token
-    const user = await User.findOne({
-      passwordResetToken: resetToken,
-    }).select("+otp +otpExpire");
+    const user = await User.findOne({ passwordResetToken: resetToken }).select(
+      "+otp +otpExpiration"
+    );
 
-    // Step 4: If user not found, log and throw error
-    if (!user) {
-      await createAuditLog({
+    if (!user || user.passwordResetTokenExpiration < Date.now()) {
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_SECURITY_ANSWER_FAILED",
-        description:
-          "Security question verification failed: Invalid or expired reset token.",
+        eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: "Invalid or expired reset token.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: "Invalid or expired reset token.",
         req,
       });
       throw new ApiError(
@@ -779,18 +1103,23 @@ const AuthController = {
       );
     }
 
-    // Step 5: Compare provided answer with stored security answer
-    const securityAnswer = await user.compareSecurityAnswer(questionId, answer);
-
-    // Step 6: If the answer doesn't match, log and throw error
-    if (!securityAnswer) {
-      await createAuditLog({
+    const isAnswerCorrect = await user.compareSecurityAnswer(
+      questionId,
+      answer
+    );
+    if (!isAnswerCorrect) {
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_SECURITY_ANSWER_FAILED",
-        description:
-          "Security question verification failed: Incorrect security answer provided.",
+        eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: "Incorrect security answer provided.",
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: "Incorrect security answer provided.",
         req,
       });
       throw new ApiError(
@@ -799,52 +1128,127 @@ const AuthController = {
       );
     }
 
-    // Step 7: Generate OTP and reset token for password reset
     const otp = generateOTP();
-    const otpExpiry = new Date(Date.now() + otpExpiresInMs);
-    const passwordResetToken = await user.generateCryptoToken();
-    const passwordResetTokenExpiration = new Date(Date.now() + otpExpiresInMs);
+    const otpExpiration = new Date(Date.now() + otpExpiresInMs);
+    const tokenExpiration = new Date(Date.now() + otpExpiresInMs);
+
+    let newResetToken;
+
+    try {
+      newResetToken = await user.generateCryptoToken();
+    } catch (error) {
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description:
+          "There was an issue generating the reset token. Please try again later.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description:
+          "There was an issue generating the reset token. Please try again later.",
+        req,
+      });
+
+      throw new ApiError(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "There was an issue generating the reset token. Please try again later."
+      );
+    }
 
     user.otp = otp;
-    user.otpExpiration = otpExpiry;
-    user.passwordResetToken = passwordResetToken;
-    user.passwordResetTokenExpiration = passwordResetTokenExpiration;
+    user.otpExpiration = otpExpiration;
+    user.passwordResetToken = newResetToken;
+    user.passwordResetTokenExpiration = tokenExpiration;
 
-    await user.save({ validateBeforeSave: false });
+    try {
+      await user.save({ validateBeforeSave: false });
+    } catch (error) {
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: `There was an issue saving the user data. Please try again later.`,
+        req,
+      });
 
-    // Step 8: Send OTP and reset URL to user's email
+      await logActivity({
+        userId: user._id,
+        action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: `There was an issue saving the user data. Please try again later.`,
+        req,
+      });
+
+      throw new ApiError(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "There was an issue saving the user data. Please try again later."
+      );
+    }
+
     const resetUrl = `${clientUrl}/reset-password/${user.passwordResetToken}`;
-    await sendEmail({
-      to: user.email,
-      subject: "Password Reset Request",
-      template: "forgotPassword",
-      context: {
-        userName: user.fullName,
-        resetUrl,
-        otp,
-        expiresIn: expireTime,
-        currentYear: new Date().getFullYear(),
-      },
-    });
+    try {
+      await sendEmail({
+        to: user.email,
+        subject: "Password Reset Request",
+        template: "forgotPassword",
+        context: {
+          userName: user.fullName,
+          resetUrl,
+          otp,
+          expiresIn: expireTime,
+          currentYear: new Date().getFullYear(),
+        },
+      });
+    } catch (error) {
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: `Email sending failed: ${error.message}`,
+        req,
+      });
 
-    // Step 9: Log the successful verification and email dispatch
-    await createAuditLog({
+      await logActivity({
+        userId: user._id,
+        action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
+        description: `Email sending failed: ${error.message}`,
+        req,
+      });
+
+      return new ApiResponse(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        { error: "Email sending failed." },
+        "There was an issue with sending the email. Please try again later."
+      ).send(res);
+    }
+
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "User",
-      eventType: "PASSWORD_RESET_SECURITY_ANSWER_SUCCESS",
-      description:
-        "Security question verification successful: I have sent you a reset Url and OTP. You can use these to reset your password.",
+      eventType: logEvents.PASSWORD_RESET_REQUEST_SUCCESS,
+      description: "Reset URL and OTP sent after successful verification.",
       req,
     });
 
-    // Step 10: Respond with success message and reset URL
+    await logActivity({
+      userId: user._id,
+      action: logEvents.PASSWORD_RESET_REQUEST_SUCCESS,
+      description: "Reset URL and OTP sent after successful verification.",
+      req,
+    });
+
     return new ApiResponse(
       StatusCodes.OK,
-      {
-        resetUrl,
-      },
-      "Security question verification successful. I have sent you a reset Url and OTP. You can use these to reset your password."
+      { resetUrl },
+      "Security question verification successful. I have sent you a reset URL and OTP. You can use these to reset your password."
     ).send(res);
   }),
 
@@ -855,11 +1259,17 @@ const AuthController = {
 
     // Step 2: Validate the presence of token and new password in the request
     if (!token || !newPassword) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
+        eventType: logEvents.PASSWORD_RESET_WITH_TOKEN_FAILED,
+        description: "Password reset failed: Missing token or new password.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_WITH_TOKEN_FAILED,
         description: "Password reset failed: Missing token or new password.",
         req,
       });
@@ -877,11 +1287,18 @@ const AuthController = {
 
     // Step 4: If no user is found, log the failure and throw an error
     if (!user) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
+        eventType: logEvents.PASSWORD_RESET_WITH_TOKEN_FAILED,
+        description:
+          "Password reset attempt failed: No user found with the provided reset token. It may be invalid or expired.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_WITH_TOKEN_FAILED,
         description:
           "Password reset attempt failed: No user found with the provided reset token. It may be invalid or expired.",
         req,
@@ -897,11 +1314,18 @@ const AuthController = {
 
     // Step 6: If the password is reused, log and reject the reset attempt
     if (isReused) {
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REJECTED_DUE_TO_REUSED_PASSWORD",
+        eventType: logEvents.PASSWORD_RESET_WITH_TOKEN_FAILED,
+        description:
+          "Password reset attempt rejected: The provided new password matches a previously used password.",
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.PASSWORD_RESET_WITH_TOKEN_FAILED,
         description:
           "Password reset attempt rejected: The provided new password matches a previously used password.",
         req,
@@ -935,11 +1359,18 @@ const AuthController = {
     await user.save({ validateBeforeSave: false });
 
     // Step 13: Log the successful password reset event
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "User",
-      eventType: "PASSWORD_RESET_SUCCESS",
+      eventType: logEvents.PASSWORD_RESET_WITH_TOKEN_SUCCESS,
+      description:
+        "Password Reset Successful: Your password has been successfully reset using the provided token. You can now log in with your new password.",
+      req,
+    });
+    await logActivity({
+      userId: user._id,
+      action: logEvents.PASSWORD_RESET_WITH_TOKEN_SUCCESS,
       description:
         "Password Reset Successful: Your password has been successfully reset using the provided token. You can now log in with your new password.",
       req,
@@ -958,11 +1389,17 @@ const AuthController = {
 
     // Step 1: Validate that all required fields are provided
     if ([email, otp, newPassword, confirmPassword].some((field) => !field)) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
+        eventType: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
+        description: "Password reset failed: Missing token or new password.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        eventType: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
         description: "Password reset failed: Missing token or new password.",
         req,
       });
@@ -974,11 +1411,17 @@ const AuthController = {
 
     // Step 2: Ensure the new password and confirm password match
     if (newPassword !== confirmPassword) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
+        eventType: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
+        description: "Password reset failed: Passwords do not match.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
         description: "Password reset failed: Passwords do not match.",
         req,
       });
@@ -988,90 +1431,89 @@ const AuthController = {
       );
     }
 
-    try {
-      // Step 3: Retrieve the user based on the provided email and include OTP fields for validation
-      const user = await User.findOne({ email }).select("+otp +otpExpire");
+    // Step 3: Retrieve the user based on the provided email and include OTP fields for validation
+    const user = await User.findOne({ email }).select("+otp +otpExpire");
 
-      // Step 4: Check if the user exists
-      if (!user) {
-        await createAuditLog({
-          actorId: null,
-          targetId: null,
-          targetModel: "User",
-          eventType: "PASSWORD_RESET_REQUEST_FAILED",
-          description: "Password reset failed: User not found.",
-          req,
-        });
-        throw new ApiError(
-          StatusCodes.NOT_FOUND,
-          "Password reset failed: User not found."
-        );
-      }
-
-      // Step 5: Verify the OTP provided by the user
-      const isValid = await user.compareOTP(otp);
-
-      // Step 6: Check if OTP is valid or expired
-      if (!isValid) {
-        await createAuditLog({
-          actorId: null,
-          targetId: null,
-          targetModel: "User",
-          eventType: "PASSWORD_RESET_REQUEST_FAILED",
-          description: "Password reset failed: Invalid or expired OTP.",
-          req,
-        });
-        throw new ApiError(
-          StatusCodes.BAD_REQUEST,
-          "Password reset failed: Invalid or expired OTP."
-        );
-      }
-
-      // Step 7: Proceed to update the user's password and clear OTP-related fields
-      user.password = newPassword;
-      user.otp = undefined;
-      user.otpExpiry = undefined;
-
-      // Step 8: Save the updated user without validation
-      await user.save({ validateBeforeSave: false });
-
-      // Step 9: Log the successful password reset action
-      await createAuditLog({
-        actorId: user._id,
-        targetId: user._id,
-        targetModel: "User",
-        eventType: "PASSWORD_RESET_SUCCESS",
-        description:
-          "Password Reset Successful: Your password has been successfully reset using the provided otp. You can now log in with your new password.",
-        req,
-      });
-
-      // Step 10: Send a success response to the user
-      return new ApiResponse(
-        StatusCodes.OK,
-        null,
-        "Password Reset Successful: Your password has been successfully reset using the provided otp. You can now log in with your new password."
-      ).send(res);
-    } catch (error) {
-      // Step 11: Log the error details for internal tracking and debugging
-      logger.error(error);
-
-      // Step 12: Create an audit log for the failure, detailing the error
-      await createAuditLog({
+    // Step 4: Check if the user exists
+    if (!user) {
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "PASSWORD_RESET_REQUEST_FAILED",
-        description: `Password reset failed: An unexpected error. Error: ${error.message}`,
+        eventType: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
+        description: "Password reset failed: User not found.",
         req,
       });
-
-      // Step 13: Throw a general error message to the user
+      await logAudit({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
+        description: "Password reset failed: User not found.",
+        req,
+      });
       throw new ApiError(
-        StatusCodes.INTERNAL_SERVER_ERROR,
-        "Password reset failed: An unexpected error occurred while processing your password reset request. Please try again later or contact support."
+        StatusCodes.NOT_FOUND,
+        "Password reset failed: User not found."
       );
     }
+
+    // Step 5: Verify the OTP provided by the user
+    const isValid = await user.compareOTP(otp);
+
+    // Step 6: Check if OTP is valid or expired
+    if (!isValid) {
+      await logAudit({
+        actorId: null,
+        targetId: null,
+        targetModel: "User",
+        eventType: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
+        description: "Password reset failed: Invalid or expired OTP.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.PASSWORD_RESET_WITH_OTP_FAILED,
+        description: "Password reset failed: Invalid or expired OTP.",
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.BAD_REQUEST,
+        "Password reset failed: Invalid or expired OTP."
+      );
+    }
+
+    // Step 7: Proceed to update the user's password and clear OTP-related fields
+    user.password = newPassword;
+    user.otp = undefined;
+    user.otpExpiry = undefined;
+
+    // Step 8: Save the updated user without validation
+    await user.save({ validateBeforeSave: false });
+
+    // Step 9: Log the successful password reset action
+    await logAudit({
+      actorId: user._id,
+      targetId: user._id,
+      targetModel: "User",
+      eventType: logEvents.PASSWORD_RESET_WITH_OTP_SUCCESS,
+      description:
+        "Password Reset Successful: Your password has been successfully reset using the provided otp. You can now log in with your new password.",
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.PASSWORD_RESET_WITH_OTP_SUCCESS,
+      description:
+        "Password Reset Successful: Your password has been successfully reset using the provided otp. You can now log in with your new password.",
+      req,
+    });
+
+    // Step 10: Send a success response to the user
+    return new ApiResponse(
+      StatusCodes.OK,
+      null,
+      "Password Reset Successful: Your password has been successfully reset using the provided otp. You can now log in with your new password."
+    ).send(res);
   }),
 
   resendOTP: asyncHandler(async (req, res) => {
@@ -1079,11 +1521,17 @@ const AuthController = {
 
     // Step 1: Validate email input
     if (!email) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "OTP_RESET_REQUEST_FAILED",
+        eventType: logEvents.OTP_RESET_REQUEST_FAILED,
+        description: "OTP reset failed: Missing email.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.OTP_RESET_REQUEST_FAILED,
         description: "OTP reset failed: Missing email.",
         req,
       });
@@ -1100,11 +1548,17 @@ const AuthController = {
 
     // Step 3: If user not found, log audit and return generic success response
     if (!user) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "OTP_RESET_REQUEST_FAILED",
+        eventType: logEvents.OTP_RESET_REQUEST_FAILED,
+        description: "OTP reset failed: No user found with provided email.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.OTP_RESET_REQUEST_FAILED,
         description: "OTP reset failed: No user found with provided email.",
         req,
       });
@@ -1116,11 +1570,18 @@ const AuthController = {
 
     // Step 4: If user is already verified, skip OTP and log audit
     if (user.isVerified) {
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "OTP_VERIFICATION_SKIPPED",
+        eventType: logEvents.OTP_RESET_REQUEST_FAILED,
+        description: "OTP verification skipped: Email is already verified.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.OTP_RESET_REQUEST_FAILED,
         description: "OTP verification skipped: Email is already verified.",
         req,
       });
@@ -1140,7 +1601,29 @@ const AuthController = {
     user.otpExpiry = otpExpiry;
     user.otpAttempts = 0;
 
-    await user.save({ validateBeforeSave: false });
+    try {
+      await user.save({ validateBeforeSave: false });
+    } catch (error) {
+      logger.error("Failed to save OTP:", error);
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "User",
+        eventType: logEvents.OTP_RESET_REQUEST_FAILED,
+        description: `Failed to update user with OTP: ${error.message}`,
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.OTP_RESET_REQUEST_FAILED,
+        description: `Failed to update user with OTP: ${error.message}`,
+        req,
+      });
+      throw new ApiError(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "Failed to update user with OTP. Please try again."
+      );
+    }
 
     // Step 7: Attempt to send verification email
     try {
@@ -1156,11 +1639,19 @@ const AuthController = {
       });
 
       // Step 8: Log successful OTP email send
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "OTP_EMAIL_SEND_SUCCESS",
+        eventType: logEvents.OTP_RESET_REQUEST_SUCCESS,
+        description:
+          "OTP verification successful: Verification email with OTP sent successfully.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.OTP_RESET_REQUEST_SUCCESS,
         description:
           "OTP verification successful: Verification email with OTP sent successfully.",
         req,
@@ -1181,11 +1672,20 @@ const AuthController = {
       await user.save({ validateBeforeSave: false });
 
       // Step 11: Log OTP email send failure
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
-        eventType: "OTP_EMAIL_SEND_FAILED",
+        eventType: logEvents.OTP_RESET_REQUEST_FAILED,
+        description: `Failed to send verification email: ${
+          error.message || "Unknown error"
+        }.`,
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.OTP_RESET_REQUEST_FAILED,
         description: `Failed to send verification email: ${
           error.message || "Unknown error"
         }.`,
@@ -1200,153 +1700,209 @@ const AuthController = {
     }
   }),
 
-  logoutUser: asyncHandler(async (req, res) => {
-    // Step 1: Retrieve the refresh token from cookies
-    const refreshToken = req.cookies?.refreshToken;
-
-    // Step 2: Check if refresh token is provided, otherwise log failure and throw an error
-    if (!refreshToken) {
-      await createAuditLog({
-        actorId: req.user?.id,
-        targetId: req.user?.id,
-        targetModel: "User",
-        eventType: "LOGOUT_FAILED",
-        description: "Logout attempt failed: Missing refresh token.",
-        req,
-      });
-      throw new ApiError(
-        StatusCodes.BAD_REQUEST,
-        "Logout attempt failed: Refresh token required."
-      );
-    }
-
-    let decoded;
+  logoutUser: asyncHandler(async (req, res, next) => {
     try {
-      // Step 3: Verify the refresh token and decode it to extract user information
-      decoded = jwt.verify(refreshToken, refreshTokenSecret);
+      // Step 1: Get refresh token from cookies
+      const refreshToken = req.cookies?.refreshToken;
+
+      // Step 2: Validate presence of refresh token
+      if (!refreshToken) {
+        await logAudit({
+          actorId: req.user?.id,
+          targetId: req.user?.id,
+          targetModel: "User",
+          eventType: logEvents.LOGOUT_FAILED,
+          description: "Logout attempt failed: Missing refresh token.",
+          req,
+        });
+        await logActivity({
+          userId: req.user?.id,
+          action: logEvents.LOGOUT_FAILED,
+          description: "Logout attempt failed: Missing refresh token.",
+          req,
+        });
+        throw new ApiError(
+          StatusCodes.BAD_REQUEST,
+          "Logout attempt failed: Refresh token required."
+        );
+      }
+
+      let decoded;
+      // Step 3: Try to verify the refresh token
+      try {
+        decoded = jwt.verify(refreshToken, refreshTokenSecret);
+      } catch (error) {
+        if (error instanceof jwt.TokenExpiredError) {
+          const decodedGracefully = jwt.decode(refreshToken);
+          const user = await User.findById(decodedGracefully?.id);
+
+          if (
+            user &&
+            user.isTokenExpiredGracefully(error.expiredAt.getTime())
+          ) {
+            await logAudit({
+              actorId: decodedGracefully?.id || null,
+              targetId: decodedGracefully?.id || null,
+              targetModel: "User",
+              eventType: logEvents.LOGOUT_FAILED,
+              description:
+                "Logout attempt failed: Token expired but within grace period.",
+              req,
+            });
+            await logActivity({
+              userId: decodedGracefully?.id || null,
+              action: logEvents.LOGOUT_FAILED,
+              description:
+                "Logout attempt failed: Token expired but within grace period.",
+              req,
+            });
+            throw new ApiError(
+              StatusCodes.UNAUTHORIZED,
+              "Logout attempt failed: Token expired but within grace period."
+            );
+          }
+        }
+
+        // For invalid, tampered, or other errors
+        await logAudit({
+          actorId: null,
+          targetId: null,
+          targetModel: "User",
+          eventType: logEvents.LOGOUT_FAILED,
+          description: "Logout attempt failed: Invalid refresh token.",
+          req,
+        });
+        await logActivity({
+          userId: null,
+          action: logEvents.LOGOUT_FAILED,
+          description: "Logout attempt failed: Invalid refresh token.",
+          req,
+        });
+        throw new ApiError(
+          StatusCodes.UNAUTHORIZED,
+          "Logout attempt failed: Invalid refresh token."
+        );
+      }
+
+      // Step 4: Find the user from decoded token
+      const user = await User.findById(decoded.id);
+      if (!user) {
+        await logAudit({
+          actorId: decoded.id,
+          targetId: decoded.id,
+          targetModel: "User",
+          eventType: logEvents.LOGOUT_FAILED,
+          description: "Logout attempt failed: User not found.",
+          req,
+        });
+        await logActivity({
+          userId: decoded.id,
+          action: logEvents.LOGOUT_FAILED,
+          description: "Logout attempt failed: User not found.",
+          req,
+        });
+        throw new ApiError(
+          StatusCodes.NOT_FOUND,
+          "Logout attempt failed: User not found."
+        );
+      }
+
+      // Step 5: Revoke active tokens and blacklist the refresh token
+      await user.revokeTokens();
+
+      const hashedToken = crypto
+        .createHash("sha256")
+        .update(refreshToken)
+        .digest("hex");
+      await TokenBlacklist.create({
+        token: hashedToken,
+        expiresAt: new Date(decoded.exp * 1000),
+        userId: user._id,
+        reason: "User logged out",
+      });
+
+      // Step 6: Hash the refresh token for session matching
+      const hashedSessionToken = await user.hashSessionToken(refreshToken);
+
+      // Step 7: Mark session as inactive
+      const session = await Session.findOneAndUpdate(
+        {
+          userId: decoded.id,
+          refreshTokenHash: hashedSessionToken,
+          isActive: true,
+        },
+        { isActive: false },
+        { new: true }
+      );
+
+      // Handle missing or already inactive session
+      if (!session) {
+        await logAudit({
+          actorId: decoded.id,
+          targetId: decoded.id,
+          targetModel: "User",
+          eventType: logEvents.LOGOUT_FAILED,
+          description: "Session not found or already inactive.",
+          req,
+        });
+        await logActivity({
+          userId: decoded.id,
+          action: logEvents.LOGOUT_FAILED,
+          description: "Session not found or already inactive.",
+          req,
+        });
+        throw new ApiError(StatusCodes.NOT_FOUND, "Session not found.");
+      }
+
+      // Step 8: Clear cookies
+      res.clearCookie("accessToken").clearCookie("refreshToken");
+
+      // Step 9: Log successful logout
+      await logAudit({
+        actorId: decoded.id,
+        targetId: decoded.id,
+        targetModel: "User",
+        eventType: logEvents.LOGOUT_SUCCESS,
+        description: "User successfully logged out.",
+        req,
+      });
+      await logActivity({
+        userId: decoded.id,
+        action: logEvents.LOGOUT_SUCCESS,
+        description: "User successfully logged out.",
+        req,
+      });
+
+      // Step 10: Invalidate all future tokens and disable 2FA
+      user.twoFactorEnabled = false;
+      await user.save({ validateBeforeSave: false });
+
+      // Step 11: Return success response
+      return new ApiResponse(
+        StatusCodes.OK,
+        null,
+        "Logged out successfully."
+      ).send(res);
     } catch (error) {
-      // Step 4: If the token is invalid, log failure and throw an error
-      await createAuditLog({
-        actorId: null,
-        targetId: null,
-        targetModel: "User",
-        eventType: "LOGOUT_FAILED",
-        description: "Logout attempt failed: Invalid refresh token.",
-        req,
-      });
-      logger.error(error); // Log the error for further investigation
-      throw new ApiError(
-        StatusCodes.UNAUTHORIZED,
-        "Logout attempt failed: Invalid refresh token."
-      );
+      next(error);
     }
-
-    // Step 5: Retrieve the user from the database using the decoded user ID from the token
-    const user = await User.findById(decoded.id);
-    if (!user) {
-      // Step 6: If no user is found, log failure and throw an error
-      await createAuditLog({
-        actorId: null,
-        targetId: null,
-        targetModel: "User",
-        eventType: "LOGOUT_FAILED",
-        description: "Logout attempt failed: User not found.",
-        req,
-      });
-      throw new ApiError(StatusCodes.NOT_FOUND, "User not found.");
-    }
-
-    // Step 7: Check if the token has expired gracefully (within grace period)
-    const isGracefulExpiration = user.isTokenExpiredGracefully(
-      decoded.exp * 1000
-    );
-    if (isGracefulExpiration) {
-      // Step 8: If the token expired gracefully, log failure and throw an error
-      await createAuditLog({
-        actorId: decoded.id,
-        targetId: decoded.id,
-        targetModel: "User",
-        eventType: "LOGOUT_FAILED",
-        description:
-          "Logout attempt failed: Token expired but within grace period.",
-        req,
-      });
-      throw new ApiError(
-        StatusCodes.UNAUTHORIZED,
-        "Logout attempt failed: Token expired but within grace period."
-      );
-    }
-
-    // Step 9: Revoke all tokens associated with the user
-    await user.revokeTokens();
-
-    // Step 10: Blacklist the specific refresh token with its expiration date
-    await TokenBlacklist.create({
-      token: refreshToken,
-      expiresAt: new Date(decoded.exp * 1000),
-      userId: user._id,
-      reason: "User logged out",
-    });
-
-    // Step 11: Hash the refresh token to match with the stored hashed token
-    const hashedToken = await user.hashSessionToken(refreshToken);
-
-    // Step 12: Deactivate the user session by updating its status to inactive
-    const session = await Session.findOneAndUpdate(
-      { userId: decoded.id, refreshTokenHash: hashedToken, isActive: true },
-      { isActive: false },
-      { new: true }
-    );
-
-    if (!session) {
-      // Step 13: If no active session is found, log failure and throw an error
-      await createAuditLog({
-        actorId: decoded.id,
-        targetId: decoded.id,
-        targetModel: "User",
-        eventType: "LOGOUT_FAILED",
-        description:
-          "Logout attempt failed: Session not found or already inactive.",
-        req,
-      });
-      throw new ApiError(StatusCodes.NOT_FOUND, "Session not found.");
-    }
-
-    // Step 14: Clear the cookies for both access and refresh tokens
-    res.clearCookie("accessToken").clearCookie("refreshToken");
-
-    // Step 15: Log the successful logout event
-    await createAuditLog({
-      actorId: decoded.id,
-      targetId: decoded.id,
-      targetModel: "User",
-      eventType: "LOGOUT_SUCCESS",
-      description: "User successfully logged out.",
-      req,
-    });
-
-    // Step 16: Update user’s token version and disable 2FA (Two-Factor Authentication)
-    user.tokenVersion += 1;
-    user.twoFactorEnabled = false;
-    await user.save({ validateBeforeSave: false });
-
-    // Step 17: Send a successful logout response to the client
-    return new ApiResponse(
-      StatusCodes.OK,
-      null,
-      "Logged out successfully."
-    ).send(res);
   }),
 
   refreshUserToken: asyncHandler(async (req, res) => {
     const incomingToken = req.cookies?.refreshToken || req.body.refreshToken;
 
     if (!incomingToken) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REFRESH_TOKEN_FAILED",
+        eventType: logEvents.REFRESH_TOKEN_FAILED,
+        description: "Refresh Token Failed: Missing refresh token.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.REFRESH_TOKEN_FAILED,
         description: "Refresh Token Failed: Missing refresh token.",
         req,
       });
@@ -1362,22 +1918,53 @@ const AuthController = {
       .update(incomingToken)
       .digest("hex");
 
-    const blacklisted = await TokenBlacklist.findOne({
-      tokenHash: hashedToken,
-    });
-
-    if (blacklisted) {
-      await createAuditLog({
+    let blacklisted;
+    try {
+      blacklisted = await TokenBlacklist.findOne({
+        tokenHash: hashedToken,
+      });
+    } catch (error) {
+      console.log("Caught error in TokenBlacklist.findOne:", error.message);
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REFRESH_TOKEN_FAILED",
-        description: "Refresh Token Failed: Token has been blacklisted.",
+        eventType: logEvents.REFRESH_TOKEN_FAILED,
+        description: "Refresh Token Failed: Database error.",
+        req,
+      });
+      await logActivity({
+        userId: null,
+        action: logEvents.REFRESH_TOKEN_FAILED,
+        description: "Refresh Token Failed: Database error.",
         req,
       });
       throw new ApiError(
+        StatusCodes.INTERNAL_SERVER_ERROR,
+        "Refresh Token Failed: Database error."
+      );
+    }
+
+    if (blacklisted) {
+      await logAudit({
+        actorId: null,
+        targetId: null,
+        targetModel: "User",
+        eventType: logEvents.REFRESH_TOKEN_FAILED,
+        description: "Refresh Token Failed: Blacklisted refresh token.",
+        req,
+      });
+
+      await logActivity({
+        userId: null,
+        action: logEvents.REFRESH_TOKEN_FAILED,
+        description: "Refresh Token Failed: Blacklisted refresh token.",
+        req,
+      });
+
+      throw new ApiError(
         StatusCodes.UNAUTHORIZED,
-        "Refresh Token Failed: Token has been blacklisted."
+        "Refresh Token Failed: Blacklisted refresh token."
       );
     }
 
@@ -1385,21 +1972,31 @@ const AuthController = {
     try {
       tokenPair = await User.rotateTokens(incomingToken, req);
     } catch (error) {
-      await createAuditLog({
+      await logAudit({
         actorId: null,
         targetId: null,
         targetModel: "User",
-        eventType: "REFRESH_TOKEN_FAILED",
+        eventType: logEvents.REFRESH_TOKEN_FAILED,
         description: "Refresh Token Failed: Refresh token rotation failed.",
         req,
       });
-      throw error;
+      await logActivity({
+        userId: null,
+        action: logEvents.REFRESH_TOKEN_FAILED,
+        description: "Refresh Token Failed: Refresh token rotation failed.",
+        req,
+      });
+      if (error instanceof ApiError) throw error;
+      throw new ApiError(
+        StatusCodes.UNAUTHORIZED,
+        error.message || "Refresh Token Failed: Refresh token rotation failed."
+      );
     }
 
     const decoded = jwt.decode(tokenPair.refreshToken);
     const user = await User.findById(decoded.id);
 
-    await createSession({
+    await logSession({
       user,
       refreshToken: tokenPair.refreshToken,
       sessionExpiry,
@@ -1411,11 +2008,18 @@ const AuthController = {
     );
 
     if (isGracefulExpiration) {
-      await createAuditLog({
+      await logAudit({
         actorId: decoded.id,
         targetId: decoded.id,
         targetModel: "User",
-        eventType: "REFRESH_TOKEN_FAILED",
+        eventType: logEvents.REFRESH_TOKEN_FAILED,
+        description:
+          "Refresh Token Failed: Token expired but within grace period.",
+        req,
+      });
+      await logActivity({
+        userId: decoded.id,
+        action: logEvents.REFRESH_TOKEN_FAILED,
         description:
           "Refresh Token Failed: Token expired but within grace period.",
         req,
@@ -1430,11 +2034,18 @@ const AuthController = {
       .cookie("accessToken", tokenPair.accessToken, options)
       .cookie("refreshToken", tokenPair.refreshToken, options);
 
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "User",
-      eventType: "REFRESH_TOKEN_SUCCESS",
+      eventType: logEvents.REFRESH_TOKEN_SUCCESS,
+      description: "Refresh Token successful: Token refreshed successfully.",
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.REFRESH_TOKEN_SUCCESS,
       description: "Refresh Token successful: Token refreshed successfully.",
       req,
     });
@@ -1456,11 +2067,18 @@ const AuthController = {
       .sort({ createdAt: -1 });
 
     // STEP 2: Create an audit log for monitoring and traceability
-    await createAuditLog({
+    await logAudit({
       actorId: req.user?._id,
       targetId: req.user?._id,
       targetModel: "TokenBlacklist",
-      eventType: "TOKENBLACK_LIST_READ",
+      eventType: logEvents.TOKEN_BLACK_LIST_READ,
+      description: "Token black list fetched: Fetched all blacklisted tokens",
+      req,
+    });
+
+    await logActivity({
+      userId: req.user?._id,
+      action: logEvents.TOKEN_BLACK_LIST_READ,
       description: "Token black list fetched: Fetched all blacklisted tokens",
       req,
     });
@@ -1482,55 +2100,92 @@ const AuthController = {
 
     // Step 2: Check if the token is provided in the request body
     if (!token) {
-      await createAuditLog({
+      // Step 2.1: Log the failure due to missing token
+      await logAudit({
         actorId: req.user?._id,
         targetId: req.user?._id,
         targetModel: "TokenBlacklist",
-        eventType: "TOKENBLACK_LIST_REMOVE",
+        eventType: logEvents.TOKEN_BLACK_LIST_REMOVE_FAILED,
         description: "Token black list remove failed: Token was not provided",
         req,
       });
+
+      await logActivity({
+        userId: req.user?._id,
+        action: logEvents.TOKEN_BLACK_LIST_REMOVE_FAILED,
+        description: "Token black list remove failed: Token was not provided",
+        req,
+      });
+
+      // Step 2.2: Throw a bad request error
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
         "Token black list remove failed: Token is required."
       );
     }
 
-    // Step 3: Attempt to find and delete the token from the blacklist
-    const deleted = await TokenBlacklist.findOneAndDelete({ token });
+    // Step 3: Hash the token to match the stored format in the blacklist
+    const hashedToken = crypto.createHash("sha256").update(token).digest("hex");
 
-    // Step 4: If no token was found and deleted from the blacklist
+    // Step 4: Attempt to find and delete the token from the blacklist
+    const deleted = await TokenBlacklist.findOneAndDelete({
+      token: hashedToken,
+    });
+
+    // Step 5: If the token was not found in the blacklist
     if (!deleted) {
-      await createAuditLog({
+      // Step 5.1: Log the failure due to token not being in blacklist
+      await logAudit({
         actorId: req.user?._id,
         targetId: req.user?._id,
         targetModel: "TokenBlacklist",
-        eventType: "TOKENBLACK_LIST_REMOVE",
+        eventType: logEvents.TOKEN_BLACK_LIST_REMOVE_FAILED,
         description:
           "Token black list remove failed: Token not found in blacklist.",
         req,
       });
+
+      await logActivity({
+        userId: req.user?._id,
+        action: logEvents.TOKEN_BLACK_LIST_REMOVE_FAILED,
+        description:
+          "Token black list remove failed: Token not found in blacklist.",
+        req,
+      });
+
+      // Step 5.2: Throw a not found error
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
         "Token black list remove failed: Token not found in blacklist."
       );
     }
 
-    // Step 5: Log the successful removal of the token from the blacklist
-    await createAuditLog({
+    // Step 6: Log the successful removal of the token from the blacklist
+    await logAudit({
       actorId: req.user?._id,
       targetId: deleted._id,
       targetModel: "TokenBlacklist",
-      eventType: "TOKENBLACKLIST_DELETE",
+      eventType: logEvents.TOKEN_BLACK_LIST_REMOVE_SUCCESS,
       description: `Token removed from blacklist: ${token}`,
       req,
     });
 
-    // Step 6: Return a success response indicating the token has been removed from the blacklist
+    await logAudit({
+      actorId: req.user?._id,
+      targetId: deleted._id,
+      targetModel: "TokenBlacklist",
+      eventType: logEvents.TOKEN_BLACK_LIST_REMOVE_SUCCESS,
+      description: `Token removed from blacklist: ${token}`,
+      req,
+    });
+
+    // Step 7: Return a success response
     return new ApiResponse(
       StatusCodes.OK,
-      null,
-      `Token removed from blacklist: ${token}`
+      {
+        token,
+      },
+      `Token removed from blacklist`
     ).send(res);
   }),
 
@@ -1539,53 +2194,25 @@ const AuthController = {
     const count = await TokenBlacklist.countDocuments();
 
     // Step 2: Create an audit log entry after fetching the count
-    await createAuditLog({
+    await logAudit({
       actorId: req.user?._id,
       targetId: req.user?._id,
       targetModel: "TokenBlacklist",
-      eventType: "TOKENBLACK_LIST_READ",
+      eventType: logEvents.TOKEN_BLACK_LIST_READ,
+      description: "Token black list count: Count all blacklisted tokens",
+      req,
+    });
+
+    await logActivity({
+      actorId: req.user?._id,
+      targetId: req.user?._id,
+      targetModel: "TokenBlacklist",
+      eventType: logEvents.TOKEN_BLACK_LIST_READ,
       description: "Token black list count: Count all blacklisted tokens",
       req,
     });
 
     // Step 3: Return the count as part of a standardized API response
-    return new ApiResponse(
-      StatusCodes.OK,
-      count,
-      "Tokens count successfully"
-    ).send(res);
-  }),
-
-  isTokenBlacklisted: asyncHandler(async (req, res) => {
-    const { token } = req.body;
-
-    // Step 1: Validate the token
-    if (!token) {
-      await createAuditLog({
-        actorId: req.user?._id,
-        targetId: req.user?._id,
-        targetModel: "TokenBlacklist",
-        eventType: "TOKENBLACK_LIST_READ",
-        description: "Token black list count: Token missing in the request",
-        req,
-      });
-      throw new ApiError(StatusCodes.BAD_REQUEST, "Token is required.");
-    }
-
-    // Step 2: Count the number of blacklisted tokens
-    const count = await TokenBlacklist.countDocuments();
-
-    // Step 3: Create an audit log after fetching the count
-    await createAuditLog({
-      actorId: req.user?._id,
-      targetId: req.user?._id,
-      targetModel: "TokenBlacklist",
-      eventType: "TOKENBLACK_LIST_READ",
-      description: "Token black list count: Count all blacklisted tokens",
-      req,
-    });
-
-    // Step 4: Return the count as part of a standardized API response
     return new ApiResponse(
       StatusCodes.OK,
       count,
@@ -1604,11 +2231,18 @@ const AuthController = {
     // Step 2: Validate Refresh Token
     if (!refreshToken) {
       // Log failure due to missing refresh token
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "Session",
-        eventType: "SESSION_CREATE",
+        eventType: logEvents.SESSION_CREATE_FAILED,
+        description: "Session creation failed: Refresh token is missing.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.SESSION_CREATE_FAILED,
         description: "Session creation failed: Refresh token is missing.",
         req,
       });
@@ -1618,7 +2252,7 @@ const AuthController = {
     }
 
     // Step 3: Create Session
-    const session = await createSession({
+    const session = await logSession({
       user,
       refreshToken,
       sessionExpiry,
@@ -1626,11 +2260,19 @@ const AuthController = {
     });
 
     // Step 4: Audit Log for Successful Session Creation
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: session._id,
       targetModel: "Session",
-      eventType: "SESSION_CREATE",
+      eventType: logEvents.SESSION_CREATE_SUCCESS,
+      description:
+        "Session created successfully: New session created for user.",
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.SESSION_CREATE_SUCCESS,
       description:
         "Session created successfully: New session created for user.",
       req,
@@ -1663,11 +2305,18 @@ const AuthController = {
       .lean();
 
     // Step 3: Log Session Retrieval
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "Session",
-      eventType: "SESSION_LIST",
+      eventType: logEvents.SESSION_LIST,
+      description: "Session list fetched: Retrieved active sessions for user.",
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.SESSION_LIST,
       description: "Session list fetched: Retrieved active sessions for user.",
       req,
     });
@@ -1700,11 +2349,19 @@ const AuthController = {
 
     // Step 4: Handle Session Not Found
     if (!session) {
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: sessionId,
         targetModel: "Session",
-        eventType: "SESSION_VIEW_FAIL",
+        eventType: logEvents.SESSION_VIEW_FAILED,
+        description:
+          "Session view failed: Session not found or does not belong to the user.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.SESSION_VIEW_FAILED,
         description:
           "Session view failed: Session not found or does not belong to the user.",
         req,
@@ -1717,11 +2374,18 @@ const AuthController = {
     }
 
     // Step 5: Audit Log for Viewing Session
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: session._id,
       targetModel: "Session",
-      eventType: "SESSION_VIEW",
+      eventType: logEvents.SESSION_VIEW_SUCCESS,
+      description: "Session view successful: Viewed specific session by ID.",
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.SESSION_VIEW_SUCCESS,
       description: "Session view successful: Viewed specific session by ID.",
       req,
     });
@@ -1752,11 +2416,19 @@ const AuthController = {
 
     // Step 3: Handle If Session is Not Found or Already Invalid
     if (!session) {
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: sessionId,
         targetModel: "Session",
-        eventType: "SESSION_INVALIDATE_FAIL",
+        eventType: logEvents.SESSION_INVALIDATION_FAILED,
+        description:
+          "Session invalidate failed: Session not found or already invalid.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.SESSION_INVALIDATION_FAILED,
         description:
           "Session invalidate failed: Session not found or already invalid.",
         req,
@@ -1773,11 +2445,18 @@ const AuthController = {
     await session.save({ validateBeforeSave: false });
 
     // Step 5: Audit Log for Invalidating Session
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: session._id,
       targetModel: "Session",
-      eventType: "SESSION_INVALIDATE",
+      eventType: logEvents.SESSION_INVALIDATION_SUCCESS,
+      description: `Session invalidated successful: Session ID ${sessionId} marked as invalid.`,
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.SESSION_INVALIDATION_SUCCESS,
       description: `Session invalidated successful: Session ID ${sessionId} marked as invalid.`,
       req,
     });
@@ -1807,11 +2486,17 @@ const AuthController = {
 
     // Step 3: Handle Session Not Found
     if (!session) {
-      await createAuditLog({
+      await logAudit({
         actorId: user._id,
         targetId: sessionId,
         targetModel: "Session",
-        eventType: "SESSION_DELETE_FAIL",
+        eventType: logEvents.SESSION_DELETE_FAILED,
+        description: `Session delete failed: Session not found or does not belong to the user.`,
+        req,
+      });
+      await logActivity({
+        userId: user._id,
+        action: logEvents.SESSION_DELETE_FAILED,
         description: `Session delete failed: Session not found or does not belong to the user.`,
         req,
       });
@@ -1822,14 +2507,21 @@ const AuthController = {
     }
 
     // Step 4: Delete Session
-    await session.remove(); // Corrected to remove the session
+    await Session.findByIdAndDelete(sessionId);
 
     // Step 5: Audit Log for Successful Deletion
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: session._id,
       targetModel: "Session",
-      eventType: "SESSION_DELETE",
+      eventType: logEvents.SESSION_DELETE_SUCCESS,
+      description: "Session delete successful: Session deleted successfully.",
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.SESSION_DELETE_SUCCESS,
       description: "Session delete successful: Session deleted successfully.",
       req,
     });
@@ -1843,49 +2535,59 @@ const AuthController = {
   }),
 
   getActiveSessionCount: asyncHandler(async (req, res) => {
-    // Step 1: Extract the User from the Request
-    const user = req.user;
+    try {
+      const user = req.user;
 
-    // Step 2: Count Active Sessions
-    const sessionCount = await Session.countDocuments({
-      userId: user._id,
-      isValid: true,
-    });
+      const sessionCount = await Session.countDocuments({
+        userId: user._id,
+        isValid: true,
+      });
 
-    // Step 2.1: If session count is not found (i.e., no active sessions)
-    if (!sessionCount) {
-      await createAuditLog({
+      await logAudit({
+        actorId: user._id,
+        targetId: user._id,
+        targetModel: "Session",
+        eventType: logEvents.SESSION_COUNT_SUCCESS,
+        description:
+          "Session retrieve successful: Active session count retrieved successfully.",
+        req,
+      });
+
+      await logActivity({
+        userId: user._id,
+        action: logEvents.SESSION_COUNT_SUCCESS,
+        description:
+          "Session retrieve successful: Active session count retrieved successfully.",
+        req,
+      });
+
+      return new ApiResponse(
+        StatusCodes.OK,
+        { sessionCount },
+        "Session retrieve successful: Active session count retrieved successfully."
+      ).send(res);
+    } catch (error) {
+      await logAudit({
         actorId: req.user._id,
         targetId: null,
         targetModel: "Session",
-        eventType: "SESSION_COUNT_FAIL",
+        eventType: logEvents.SESSION_COUNT_FAILED,
         description: `Session retrieve failed: ${error.message}`,
         req,
       });
 
-      // Step 2.2: Throw an error if session retrieval fails
+      await logActivity({
+        userId: req.user._id,
+        action: logEvents.SESSION_COUNT_FAILED,
+        description: `Session retrieve failed: ${error.message}`,
+        req,
+      });
+
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
         `Session retrieve failed: ${error.message}`
       );
     }
-
-    // Step 3: Log success if session count retrieval is successful
-    await createAuditLog({
-      actorId: req.user._id,
-      targetId: req.user._id,
-      targetModel: "Session",
-      eventType: "SESSION_COUNT_SUCCESS",
-      description: `Session retrieve successful: Active session count retrieved successfully.`,
-      req,
-    });
-
-    // Step 4: Respond with the Active Session Count
-    return new ApiResponse(
-      StatusCodes.OK,
-      { sessionCount },
-      "Session retrieve successful: Active session count retrieved successfully."
-    ).send(res);
   }),
 
   logoutAllSessions: asyncHandler(async (req, res) => {
@@ -1902,11 +2604,18 @@ const AuthController = {
     await Session.deleteMany({ userId: user._id });
 
     // Step 4: Log the logout event for auditing purposes
-    await createAuditLog({
+    await logAudit({
       actorId: user._id,
       targetId: user._id,
       targetModel: "Session",
-      eventType: "LOGOUT_ALL_SESSIONS",
+      eventType: logEvents.LOGOUT_ALL_SESSIONS,
+      description: `Session logout successful: All sessions for user ${user._id} have been logged out.`,
+      req,
+    });
+
+    await logActivity({
+      userId: user._id,
+      action: logEvents.LOGOUT_ALL_SESSIONS,
       description: `Session logout successful: All sessions for user ${user._id} have been logged out.`,
       req,
     });
@@ -1929,11 +2638,18 @@ const AuthController = {
     });
 
     // Step 3: Create an audit log for the cleanup operation
-    await createAuditLog({
+    await logAudit({
       actorId: req.user?._id || null,
       targetId: null,
       targetModel: "Session",
-      eventType: "SESSION_INVALIDATE",
+      eventType: logEvents.SESSION_INVALIDATION_SUCCESS,
+      description: `Expired session cleanup completed successfully. ${result.deletedCount} session(s) removed.`,
+      req,
+    });
+
+    await logActivity({
+      userId: req.user?._id || null,
+      action: logEvents.SESSION_INVALIDATION_SUCCESS,
       description: `Expired session cleanup completed successfully. ${result.deletedCount} session(s) removed.`,
       req,
     });
