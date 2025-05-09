@@ -30,7 +30,7 @@ import {
   logAudit,
   logLoginAttempt,
   logSession,
-} from "utils/logger.js";
+} from "../../utils/logger.js";
 
 // ==============================
 // Config / Services
@@ -63,7 +63,7 @@ const AuthController = {
   // Authentication Controller
   // ==============================
   registerUser: asyncHandler(async (req, res) => {
-    // Step 1: Extracting required fields from the request body
+    // Step 1: Extract input fields from request body
     const {
       fullName,
       email,
@@ -74,7 +74,7 @@ const AuthController = {
       securityQuestions,
     } = req.body;
 
-    // Step 2: Validate required fields (Full Name, Email, Phone, Username, Password)
+    // Step 2: Validate presence of required fields
     if ([fullName, email, phone, userName, password].some((f) => !f)) {
       await logAudit({
         actorId: null,
@@ -87,11 +87,11 @@ const AuthController = {
       });
       throw new ApiError(
         StatusCodes.BAD_REQUEST,
-        `Registration failed: Missing required registration fields.`
+        "Registration failed: Missing required registration fields."
       );
     }
 
-    // Step 3: Validate reCAPTCHA token presence
+    // Step 3: Validate reCAPTCHA token
     if (!recaptchaToken) {
       await logAudit({
         actorId: null,
@@ -107,7 +107,7 @@ const AuthController = {
       );
     }
 
-    // Step 4: Validate avatar file (ensure avatar image is uploaded)
+    // Step 4: Ensure avatar file is uploaded
     const avatarPath = req?.file?.path;
     if (!avatarPath) {
       await logAudit({
@@ -124,7 +124,7 @@ const AuthController = {
       );
     }
 
-    // Step 5: Upload avatar image to Cloudinary
+    // Step 5: Upload avatar to Cloudinary
     const avatar = await uploadFileToCloudinary(avatarPath);
     if (!avatar) {
       await logAudit({
@@ -141,20 +141,18 @@ const AuthController = {
       );
     }
 
-    // Step 6: Check if user already exists (based on email or phone)
+    // Step 6: Check if user with same email or phone already exists
     const existingUser = await User.findOne({
-      $or: [{ email }, { phone }],
+      $or: [{ email: email.toLowerCase() }, { phone }],
     });
 
-    // Step 7: If the user already exists, log and throw an error
     if (existingUser) {
       await logAudit({
         actorId: existingUser._id,
         targetId: existingUser._id,
         targetModel: "User",
         eventType: logEvents.REGISTER_FAILED,
-        description:
-          "Registration failed: User with same email or phone already exists.",
+        description: "Registration failed: Email or phone already exists.",
         req,
       });
       throw new ApiError(
@@ -163,14 +161,13 @@ const AuthController = {
       );
     }
 
-    // Step 8: Generate OTP and set expiry time for OTP
+    // Step 7: Generate OTP and its expiry
     const otp = generateOTP();
     const otpExpiry = new Date(Date.now() + otpExpiresInMs);
 
-    // Step 9: Verify reCAPTCHA token with Google
+    // Step 8: Verify reCAPTCHA with Google
     const recaptchaResponse = await User.verifyRecaptcha(recaptchaToken);
 
-    // Step 10: If reCAPTCHA verification fails, log and throw an error
     if (!recaptchaResponse?.success) {
       await logAudit({
         actorId: null,
@@ -186,10 +183,10 @@ const AuthController = {
       );
     }
 
-    // Step 11: Create a new user in the database with the provided and generated details
+    // Step 9: Create new user document
     const user = await User.create({
       fullName,
-      email,
+      email: email.toLowerCase(),
       userName,
       phone,
       password,
@@ -206,11 +203,11 @@ const AuthController = {
         : [],
     });
 
-    // Step 12: Reset OTP attempts for the new user
+    // Step 10: Reset OTP attempts
     await user.resetOtpAttempts();
 
     try {
-      // Step 13: Send OTP email for email verification
+      // Step 11: Send OTP email for email verification
       await sendEmail({
         to: user.email,
         subject: "Email Verification",
@@ -218,7 +215,7 @@ const AuthController = {
         context: { name: user.fullName, otp, expiresIn: expireTime },
       });
 
-      // Step 14: Create a successful registration audit log
+      // Step 12: Create a successful registration audit log
       await logAudit({
         actorId: user._id,
         targetId: user._id,
@@ -229,7 +226,7 @@ const AuthController = {
         req,
       });
 
-      // Step 15: Record an activity log entry for successful registration
+      // Step 13: Record an activity log entry for successful registration
       await logActivity({
         userId: user._id,
         target: user._id,
@@ -239,7 +236,7 @@ const AuthController = {
         req,
       });
 
-      // Step 16: Return success response with user details
+      // Step 14: Return success response with user details
       return new ApiResponse(
         StatusCodes.CREATED,
         {
@@ -253,12 +250,12 @@ const AuthController = {
         "Registration successfully: User successfully completed the registration process. Please verify your email."
       ).send(res);
     } catch (error) {
-      // Step 17: In case of error (e.g. email sending fails), cleanup and log failure
+      // Step 15: In case of error (e.g. email sending fails), cleanup and log failure
       await User.findByIdAndDelete(user._id);
       await deleteFileToCloudinary(avatar.publicId);
       logger.error(error);
 
-      // Step 18: Log audit entry for email sending failure
+      // Step 16: Log audit entry for email sending failure
       await logAudit({
         actorId: user._id,
         targetId: user._id,
@@ -269,7 +266,7 @@ const AuthController = {
         req,
       });
 
-      // Step 19: Throw generic error to client
+      // Step 17: Throw generic error to client
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
         "Registration failed: An error occurred during the email verification process. Please try again later."
@@ -1052,10 +1049,12 @@ const AuthController = {
   }),
 
   verifySecurityQuestion: asyncHandler(async (req, res) => {
+    // STEP 1: Extract and validate input
     const { answer, resetToken } = req.body;
     const questionId = req.session?.resetQuestion || req.body.testQuestionId;
 
     if (!answer || !resetToken || !questionId) {
+      // Log audit and activity for missing fields
       await logAudit({
         actorId: null,
         targetId: null,
@@ -1078,11 +1077,13 @@ const AuthController = {
       );
     }
 
+    // STEP 2: Find user by reset token and check token expiration
     const user = await User.findOne({ passwordResetToken: resetToken }).select(
       "+otp +otpExpiration"
     );
 
     if (!user || user.passwordResetTokenExpiration < Date.now()) {
+      // Log invalid/expired token
       await logAudit({
         actorId: null,
         targetId: null,
@@ -1103,11 +1104,13 @@ const AuthController = {
       );
     }
 
+    // STEP 3: Compare provided answer with stored hashed answer
     const isAnswerCorrect = await user.compareSecurityAnswer(
       questionId,
       answer
     );
     if (!isAnswerCorrect) {
+      // Log incorrect answer attempt
       await logAudit({
         actorId: user._id,
         targetId: user._id,
@@ -1128,15 +1131,16 @@ const AuthController = {
       );
     }
 
+    // STEP 4: Generate OTP and new secure reset token
     const otp = generateOTP();
     const otpExpiration = new Date(Date.now() + otpExpiresInMs);
     const tokenExpiration = new Date(Date.now() + otpExpiresInMs);
 
     let newResetToken;
-
     try {
       newResetToken = await user.generateCryptoToken();
     } catch (error) {
+      // Log token generation error
       await logAudit({
         actorId: user._id,
         targetId: user._id,
@@ -1146,7 +1150,6 @@ const AuthController = {
           "There was an issue generating the reset token. Please try again later.",
         req,
       });
-
       await logActivity({
         userId: user._id,
         action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
@@ -1154,43 +1157,46 @@ const AuthController = {
           "There was an issue generating the reset token. Please try again later.",
         req,
       });
-
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
         "There was an issue generating the reset token. Please try again later."
       );
     }
 
+    // STEP 5: Store OTP and updated token info in user object
     user.otp = otp;
     user.otpExpiration = otpExpiration;
     user.passwordResetToken = newResetToken;
     user.passwordResetTokenExpiration = tokenExpiration;
 
+    // STEP 6: Save updated user without validation
     try {
       await user.save({ validateBeforeSave: false });
     } catch (error) {
+      // Log save failure
       await logAudit({
         actorId: user._id,
         targetId: user._id,
         targetModel: "User",
         eventType: logEvents.PASSWORD_RESET_REQUEST_FAILED,
-        description: `There was an issue saving the user data. Please try again later.`,
+        description:
+          "There was an issue saving the user data. Please try again later.",
         req,
       });
-
       await logActivity({
         userId: user._id,
         action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
-        description: `There was an issue saving the user data. Please try again later.`,
+        description:
+          "There was an issue saving the user data. Please try again later.",
         req,
       });
-
       throw new ApiError(
         StatusCodes.INTERNAL_SERVER_ERROR,
         "There was an issue saving the user data. Please try again later."
       );
     }
 
+    // STEP 7: Send password reset email with OTP and reset URL
     const resetUrl = `${clientUrl}/reset-password/${user.passwordResetToken}`;
     try {
       await sendEmail({
@@ -1206,6 +1212,7 @@ const AuthController = {
         },
       });
     } catch (error) {
+      // Log email failure
       await logAudit({
         actorId: user._id,
         targetId: user._id,
@@ -1214,14 +1221,12 @@ const AuthController = {
         description: `Email sending failed: ${error.message}`,
         req,
       });
-
       await logActivity({
         userId: user._id,
         action: logEvents.PASSWORD_RESET_REQUEST_FAILED,
         description: `Email sending failed: ${error.message}`,
         req,
       });
-
       return new ApiResponse(
         StatusCodes.INTERNAL_SERVER_ERROR,
         { error: "Email sending failed." },
@@ -1229,6 +1234,7 @@ const AuthController = {
       ).send(res);
     }
 
+    // STEP 8: Log successful verification and email delivery
     await logAudit({
       actorId: user._id,
       targetId: user._id,
@@ -1245,6 +1251,7 @@ const AuthController = {
       req,
     });
 
+    // STEP 9: Send success response to client
     return new ApiResponse(
       StatusCodes.OK,
       { resetUrl },
@@ -1254,8 +1261,7 @@ const AuthController = {
 
   resetUserPasswordWithToken: asyncHandler(async (req, res) => {
     // Step 1: Extract token and new password from request parameters and body
-    const { token } = req.params;
-    const { newPassword } = req.body;
+    const { newPassword, token } = req.body;
 
     // Step 2: Validate the presence of token and new password in the request
     if (!token || !newPassword) {
@@ -1795,6 +1801,7 @@ const AuthController = {
           description: "Logout attempt failed: User not found.",
           req,
         });
+
         await logActivity({
           userId: decoded.id,
           action: logEvents.LOGOUT_FAILED,
@@ -1889,8 +1896,10 @@ const AuthController = {
   }),
 
   refreshUserToken: asyncHandler(async (req, res) => {
+    // Step 1: Extract the refresh token from cookies or request body
     const incomingToken = req.cookies?.refreshToken || req.body.refreshToken;
 
+    // Step 2: If token is missing, log and return error
     if (!incomingToken) {
       await logAudit({
         actorId: null,
@@ -1912,17 +1921,16 @@ const AuthController = {
       );
     }
 
-    // Check if blacklisted (use hashed version for consistency)
+    // Step 3: Hash the incoming token for safe lookup in blacklist
     const hashedToken = crypto
       .createHash("sha256")
       .update(incomingToken)
       .digest("hex");
 
+    // Step 4: Check if the token is blacklisted
     let blacklisted;
     try {
-      blacklisted = await TokenBlacklist.findOne({
-        tokenHash: hashedToken,
-      });
+      blacklisted = await TokenBlacklist.findOne({ tokenHash: hashedToken });
     } catch (error) {
       console.log("Caught error in TokenBlacklist.findOne:", error.message);
       await logAudit({
@@ -1945,6 +1953,7 @@ const AuthController = {
       );
     }
 
+    // Step 5: If token is found in blacklist, reject the request
     if (blacklisted) {
       await logAudit({
         actorId: null,
@@ -1954,20 +1963,19 @@ const AuthController = {
         description: "Refresh Token Failed: Blacklisted refresh token.",
         req,
       });
-
       await logActivity({
         userId: null,
         action: logEvents.REFRESH_TOKEN_FAILED,
         description: "Refresh Token Failed: Blacklisted refresh token.",
         req,
       });
-
       throw new ApiError(
         StatusCodes.UNAUTHORIZED,
         "Refresh Token Failed: Blacklisted refresh token."
       );
     }
 
+    // Step 6: Attempt to rotate tokens
     let tokenPair;
     try {
       tokenPair = await User.rotateTokens(incomingToken, req);
@@ -1993,9 +2001,11 @@ const AuthController = {
       );
     }
 
+    // Step 7: Decode the new refresh token to get the user ID
     const decoded = jwt.decode(tokenPair.refreshToken);
     const user = await User.findById(decoded.id);
 
+    // Step 8: Log the session for auditing and tracking purposes
     await logSession({
       user,
       refreshToken: tokenPair.refreshToken,
@@ -2003,6 +2013,7 @@ const AuthController = {
       req,
     });
 
+    // Step 9: Check if the new token is already close to expiration (grace period)
     const isGracefulExpiration = user.isTokenExpiredGracefully(
       decoded.exp * 1000
     );
@@ -2030,10 +2041,12 @@ const AuthController = {
       );
     }
 
+    // Step 10: Set new tokens as cookies in response
     res
       .cookie("accessToken", tokenPair.accessToken, options)
       .cookie("refreshToken", tokenPair.refreshToken, options);
 
+    // Step 11: Log success events
     await logAudit({
       actorId: user._id,
       targetId: user._id,
@@ -2050,6 +2063,7 @@ const AuthController = {
       req,
     });
 
+    // Step 12: Return the new token pair in the response
     return new ApiResponse(
       StatusCodes.OK,
       { token: tokenPair },
@@ -2061,7 +2075,7 @@ const AuthController = {
   // Black List Controller
   // ==============================
   getAllBlacklistedTokens: asyncHandler(async (req, res) => {
-    // STEP 1: Fetch all blacklisted tokens from the database
+    // Step 1: Fetch all blacklisted tokens from the database
     const tokens = await TokenBlacklist.find()
       .populate("userId", "fullName userName email phone avatar role")
       .sort({ createdAt: -1 });
@@ -2083,7 +2097,7 @@ const AuthController = {
       req,
     });
 
-    // STEP 3: Send the final response to the client
+    // STEP 13: Send the final response to the client
     return new ApiResponse(
       StatusCodes.OK,
       {

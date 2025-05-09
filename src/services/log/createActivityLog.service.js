@@ -6,12 +6,12 @@ import { UAParser } from "ua-parser-js";
 // ==============================
 // Model
 // ==============================
-import ActivityLog from "../models/activityLogin.model.js";
+import ActivityLog from "../../models/activityLogin.model.js";
 
 // ==============================
 // logger
 // ==============================
-import logger from "../logger/logger.js";
+import logger from "../../logger/logger.js";
 
 // ==============================
 // Helper Function for Device Parsing

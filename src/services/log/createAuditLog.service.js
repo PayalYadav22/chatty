@@ -1,7 +1,7 @@
 // ==============================
 // Model
 // ==============================
-import AuditLog from "../models/auditLogin.model.js";
+import AuditLog from "../../models/auditLogin.model.js";
 import { UAParser } from "ua-parser-js";
 
 // ==============================

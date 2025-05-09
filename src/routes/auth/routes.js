@@ -31,6 +31,9 @@ import validateRequest from "../../middleware/validateRequest.middleware.js";
 import {
   loginUserSchema,
   registerUserSchema,
+  verifyEmailSchema,
+  resetPasswordTokenSchema,
+  resetPasswordOtpSchema,
 } from "../../validations/auth.validation.js";
 
 const router = express.Router();
@@ -44,7 +47,6 @@ router
   .route("/register")
   .post(
     upload.single("avatar"),
-    registerLimiter,
     validateRequest(registerUserSchema),
     AuthController.registerUser
   );
@@ -54,7 +56,13 @@ router
  * @desc    Verify a new user email with OTP
  * @access  Public
  */
-router.route("/verify-email").post(generalLimiter, AuthController.verifyUser);
+router
+  .route("/verify-email")
+  .post(
+    generalLimiter,
+    validateRequest(verifyEmailSchema),
+    AuthController.verifyUser
+  );
 
 /**
  * @route   POST /api/v1/auth/login
@@ -95,7 +103,11 @@ router
  */
 router
   .route("/reset-password-otp")
-  .post(generalLimiter, AuthController.resetUserPasswordWithOTP);
+  .post(
+    generalLimiter,
+    validateRequest(resetPasswordOtpSchema),
+    AuthController.resetUserPasswordWithOTP
+  );
 
 /**
  * @route   POST /api/v1/auth/reset-password/:token
@@ -103,8 +115,12 @@ router
  * @access  Public
  */
 router
-  .route("/reset-password/:token")
-  .post(generalLimiter, AuthController.resetUserPasswordWithToken);
+  .route("/reset-password")
+  .post(
+    validateRequest(resetPasswordTokenSchema),
+    generalLimiter,
+    AuthController.resetUserPasswordWithToken
+  );
 
 /**
  * @route   POST /api/v1/auth/refresh-token

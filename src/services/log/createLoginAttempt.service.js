@@ -1,7 +1,7 @@
 // ==============================
 // Model
 // ==============================
-import LoginAttempt from "../models/loginAttempt.model.js";
+import LoginAttempt from "../../models/loginAttempt.model.js";
 
 // ==============================
 // Request Meta Data

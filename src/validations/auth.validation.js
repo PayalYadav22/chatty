@@ -53,3 +53,60 @@ export const loginUserSchema = Joi.object({
   .messages({
     "object.missing": "Either email or phone is required.",
   });
+
+export const verifyEmailSchema = Joi.object({
+  email: Joi.string()
+    .email({ tlds: { allow: false } })
+    .required(),
+  otp: Joi.string().required(),
+});
+
+export const resetPasswordTokenSchema = Joi.object({
+  newPassword: Joi.string()
+    .min(8)
+    .max(64)
+    .pattern(/[a-z]/, "lowercase")
+    .pattern(/[A-Z]/, "uppercase")
+    .pattern(/[0-9]/, "number")
+    .pattern(/[^a-zA-Z0-9]/, "special")
+    .required()
+    .messages({
+      "string.pattern.name":
+        "Password must contain at least one {#name} character.",
+    })
+    .required(),
+  token: Joi.string().required(),
+});
+
+export const resetPasswordOtpSchema = Joi.object({
+  email: Joi.string()
+    .email({ tlds: { allow: false } })
+    .required(),
+  otp: Joi.string().required(),
+  confirmPassword: Joi.string()
+    .min(8)
+    .max(64)
+    .pattern(/[a-z]/, "lowercase")
+    .pattern(/[A-Z]/, "uppercase")
+    .pattern(/[0-9]/, "number")
+    .pattern(/[^a-zA-Z0-9]/, "special")
+    .required()
+    .messages({
+      "string.pattern.name":
+        "Password must contain at least one {#name} character.",
+    })
+    .required(),
+  newPassword: Joi.string()
+    .min(8)
+    .max(64)
+    .pattern(/[a-z]/, "lowercase")
+    .pattern(/[A-Z]/, "uppercase")
+    .pattern(/[0-9]/, "number")
+    .pattern(/[^a-zA-Z0-9]/, "special")
+    .required()
+    .messages({
+      "string.pattern.name":
+        "Password must contain at least one {#name} character.",
+    })
+    .required(),
+});

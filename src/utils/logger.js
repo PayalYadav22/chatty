@@ -14,7 +14,7 @@ import createLoginAttempt from "../services/log/createLoginAttempt.service.js";
 // ==============================
 // Logger
 // ==============================
-import logger from "logger/logger.js";
+import logger from "../logger/logger.js";
 
 // ==============================
 // Utils

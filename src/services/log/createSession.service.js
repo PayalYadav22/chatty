@@ -1,7 +1,7 @@
 // ==============================
 // External Packages
 // ==============================
-import Session from "../models/session.model.js";
+import Session from "../../models/session.model.js";
 import { UAParser } from "ua-parser-js";
 
 // ==============================
