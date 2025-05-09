@@ -2661,9 +2661,6 @@ describe("Auth Controller - Resend OTP", () => {
         .post(endpoint)
         .send({ email: dummyUser.email });
 
-      console.log(res.body);
-      console.log(res.status);
-
       expect(res.status).toBe(StatusCodes.OK);
       expect(res.body.message).toBe(
         "OTP verification successful: If an account exists with this email, a new OTP has been sent for verification. Please check your inbox."
