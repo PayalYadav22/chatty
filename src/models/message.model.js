@@ -1,10 +1,10 @@
 // ==============================
-// External Packages
+// External Packanges
 // ==============================
 import mongoose from "mongoose";
 
 // ==============================
-// Schema Definition
+// Message Schema
 // ==============================
 const messageSchema = new mongoose.Schema(
   {
@@ -20,7 +20,6 @@ const messageSchema = new mongoose.Schema(
     },
     content: {
       type: String,
-      required: [true, "Content is required."],
       trim: true,
       minlength: [1, "Content cannot be empty."],
       maxlength: [1000, "Content cannot exceed 1000 characters."],
@@ -40,7 +39,6 @@ const messageSchema = new mongoose.Schema(
       },
       publicId: {
         type: String,
-        required: [true, "Image publicId is required when an image is sent."],
       },
     },
     video: {
@@ -55,11 +53,15 @@ const messageSchema = new mongoose.Schema(
       },
       publicId: {
         type: String,
-        required: [true, "Video publicId is required when a video is sent."],
+      },
+      type: {
+        type: String,
       },
       duration: {
         type: Number,
-        required: [true, "Video duration is required."],
+        required: function () {
+          return !!this.video?.url;
+        },
         min: [1, "Video duration must be at least 1 second."],
       },
       thumbnailUrl: {
@@ -67,7 +69,7 @@ const messageSchema = new mongoose.Schema(
         validate: {
           validator: (value) =>
             /^https?:\/\/.*\.(jpg|jpeg|png|gif)$/i.test(value),
-          message: "Invalid thumbnail URL format.",
+          message: "Invalid thumbnail image URL format.",
         },
       },
     },
@@ -81,13 +83,42 @@ const messageSchema = new mongoose.Schema(
         emoji: { type: String },
       },
     ],
+    labels: [
+      {
+        userId: {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: "User",
+          required: true,
+        },
+        label: {
+          type: String,
+          required: true,
+          enum: ["Important", "Work", "Personal", "Spam", "ToDo"],
+        },
+      },
+    ],
+    forwardedFrom: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "Message",
+    },
   },
   { timestamps: true }
 );
 
 // ==============================
-// Model Export
+// Indexs
+// ==============================
+messageSchema.index({ senderId: 1, receiverId: 1, createdAt: 1 });
+messageSchema.index({ content: "text" });
+messageSchema.index({ seen: 1 });
+messageSchema.index({ "image.url": 1 });
+messageSchema.index({ "video.url": 1 });
+messageSchema.index({ "reactions.emoji": 1 });
+messageSchema.index({ pinned: 1 });
+messageSchema.index({ "labels.label": 1 });
+
+// ==============================
+// Exports
 // ==============================
 const Message = mongoose.model("Message", messageSchema);
-
 export default Message;

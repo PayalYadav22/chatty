@@ -607,7 +607,6 @@ UserSchema.statics.verifyRecaptcha = async function (recaptchaToken) {
 // ==============================
 // Export
 // ==============================
-
 const User = mongoose.model("User", UserSchema);
 
 export default User;

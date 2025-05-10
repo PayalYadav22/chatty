@@ -10,6 +10,21 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage: storage });
+const fileFilter = (req, res, cb) => {
+  const allowedMimeTypes = [
+    "image/jpeg",
+    "image/png",
+    "video/mp4",
+    "video/quicktime",
+  ];
+
+  if (allowedMimeTypes.includes(file.mimetype)) {
+    cb(null, true);
+  } else {
+    cb(new Error("Unsupported file type."), false);
+  }
+};
+
+const upload = multer({ storage, fileFilter });
 
 export default upload;

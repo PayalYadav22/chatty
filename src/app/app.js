@@ -10,6 +10,7 @@ import attachRequestMeta from "../middleware/requestMeta.middleware.js";
 import notFound from "../middleware/notFound.middleware.js";
 import errorHandler from "../middleware/errorHandler.middleware.js";
 import { SessionSecretKey, mongoUrl, options } from "../constants/constant.js";
+import logger from "../logger/logger.js";
 
 const app = express();
 const server = http.createServer(app);
@@ -81,22 +82,38 @@ const io = new Server(server, {
   },
 });
 
+const socketIdMap = {};
+
+function getSocketIdForUser(userId) {
+  return socketIdMap[userId];
+}
+
 // Socket.io Events
 io.on("connection", (socket) => {
-  console.log(`${socket.id} user just connected`);
+  const userId = socket.handshake.query.userId;
+  socketIdMap[userId] = socket.id;
+  logger.info(`${socket.id} user just connected`);
 
-  socket.on("send_message", (data) => {
-    console.log("Message Received:", data);
-    io.to(data.receiverId).emit("receive_message", data);
+  socket.on("sendMessage", (messageData) => {
+    io.to(messageData.receiverId).emit("newMessage", messageData);
   });
 
   socket.on("join_room", (roomId) => {
     socket.join(roomId);
-    console.log(`User joined room ${roomId}`);
+    logger.info(`User joined room ${roomId}`);
+  });
+
+  io.to(receiverId).emit("newUnseenMessage", message);
+
+  io.to(senderId).emit("messagesSeen", {
+    receiverId,
+    senderId,
+    messageCount: result.modifiedCount,
   });
 
   socket.on("disconnect", () => {
-    console.log("A user disconnected");
+    delete socketIdMap[userId];
+    logger.info("A user disconnected");
   });
 });
 

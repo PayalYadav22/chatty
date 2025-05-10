@@ -99,6 +99,18 @@ export const expireTime = Date.now() + 15 * 60 * 1000; // Current time + 15 mins
 export const tokenGracePeriod = 5 * 60 * 1000; // Token grace period: 5 minutes
 
 // ==============================
+// Message Label
+// ==============================
+export const validLabels = ["Important", "Work", "Personal", "Spam", "ToDo"];
+export const validVideo = ["video/mp4", "video/avi", "video/mkv"];
+export const privateOptions = ["public", "private", "invite-only"];
+export const maxFileSize = "2gb";
+export const maxInvites = 25;
+export const maxUsers = 25;
+export const maxUpdates = 50;
+export const validRoles = ["admin", "moderator", "member"];
+export const validSettings = ["allowMemberInvites", "muteNotifications"];
+// ==============================
 // Activity Login
 // ==============================
 export const logEvents = {
